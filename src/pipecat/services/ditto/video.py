@@ -175,7 +175,11 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Initializing Ditto StreamSDK...")
             self._sdk = StreamSDK(self._cfg_pkl, self._data_root)
 
-            logger.info(f"{self}: SDK online_mode: {self._sdk.online_mode}")
+            # Log online_mode if available
+            if hasattr(self._sdk, 'online_mode'):
+                logger.info(f"{self}: SDK online_mode: {self._sdk.online_mode}")
+            else:
+                logger.info(f"{self}: SDK initialized (online_mode attribute not available)")
 
             # Setup SDK with source image and temporary output path
             import tempfile
