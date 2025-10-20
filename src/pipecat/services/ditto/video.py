@@ -156,8 +156,6 @@ class DittoTalkingHeadService(FrameProcessor):
         - A clear front-facing photo of a person's face
         - PNG or JPG format, 512x512+ resolution recommended
         """
-        await super().start(frame)
-
         if self._initialized:
             return
 
@@ -209,8 +207,6 @@ class DittoTalkingHeadService(FrameProcessor):
 
     async def stop(self, frame: EndFrame):
         """Clean up resources"""
-        await super().stop(frame)
-
         self._frame_reader_running = False
 
         # Cancel tasks
@@ -244,7 +240,6 @@ class DittoTalkingHeadService(FrameProcessor):
 
     async def cancel(self, frame: CancelFrame):
         """Cancel any ongoing operations"""
-        await super().cancel(frame)
         self._interrupted = True
 
         if self._audio_processing_task:
