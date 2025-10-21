@@ -196,43 +196,51 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: SDK setup completed, worker threads started")
             logger.info(f"{self}: Original writer type: {type(self._sdk.writer)}")
 
-            # Wrap the writer object with a custom callable
-            # The worker thread calls self.writer(frame, fmt="rgb")
-            frame_count = [0]  # Use list to allow mutation in nested function
-            original_writer = self._sdk.writer
+            # IMPORTANT: The SDK's worker threads call writer(frame, fmt="rgb")
+            # After setup(), worker threads already have a reference to the writer object
+            # We need to intercept calls to the writer to capture frames
+            #
+            # Strategy: Replace the writer's write_frame method (or whatever method it uses)
+            # Let's inspect the writer object to see what methods it has
+            logger.info(f"{self}: Writer object methods: {[m for m in dir(self._sdk.writer) if not m.startswith('_')]}")
 
-            class WriterWrapper:
-                """Wrapper that captures frames before passing to original writer"""
-                def __init__(self, original, capture_queue, service_self):
-                    self.original = original
-                    self.capture_queue = capture_queue
-                    self.service_self = service_self
-                    self.frame_count = 0
+            # Try to find the method that actually writes frames
+            # Common names: write_frame, write, __call__, append_data
+            original_writer_obj = self._sdk.writer
+            frame_count = [0]
 
-                def __call__(self, frame_rgb, fmt="rgb"):
-                    try:
-                        # Capture frame for streaming
-                        if isinstance(frame_rgb, np.ndarray):
-                            self.capture_queue.put(frame_rgb)
-                            self.frame_count += 1
-                            if self.frame_count % 25 == 0:  # Log every second
-                                logger.info(f"{self.service_self}: Custom writer captured {self.frame_count} frames")
+            # Check if writer has a write_frame method
+            if hasattr(original_writer_obj, 'write_frame'):
+                logger.info(f"{self}: Found write_frame method, patching it")
+                original_write_frame = original_writer_obj.write_frame
 
-                        # Call original writer
-                        return self.original(frame_rgb, fmt=fmt)
-                    except Exception as e:
-                        logger.error(f"{self.service_self}: Error in writer wrapper: {e}")
-                        import traceback
-                        traceback.print_exc()
+                def patched_write_frame(frame_rgb):
+                    if isinstance(frame_rgb, np.ndarray):
+                        self._frame_capture_queue.put(frame_rgb.copy())
+                        frame_count[0] += 1
+                        if frame_count[0] % 25 == 0:
+                            logger.info(f"{self}: Captured {frame_count[0]} frames via write_frame")
+                    return original_write_frame(frame_rgb)
 
-                def __getattr__(self, name):
-                    # Delegate attribute access to original writer
-                    return getattr(self.original, name)
+                original_writer_obj.write_frame = patched_write_frame
 
-            # Replace the writer with our wrapper
-            self._sdk.writer = WriterWrapper(original_writer, self._frame_capture_queue, self)
-            logger.info(f"{self}: Wrapped VideoWriterByImageIO with frame capturer")
-            logger.debug(f"{self}: Original writer type: {type(original_writer)}")
+            # Also patch __call__ if it exists as a backup
+            if callable(original_writer_obj):
+                logger.info(f"{self}: Writer is callable, patching __call__")
+                original_class = original_writer_obj.__class__
+                original_call = original_class.__call__
+
+                def patched_call(self_writer, frame_rgb, fmt="rgb"):
+                    if isinstance(frame_rgb, np.ndarray):
+                        self._frame_capture_queue.put(frame_rgb.copy())
+                        frame_count[0] += 1
+                        if frame_count[0] % 25 == 0:
+                            logger.info(f"{self}: Captured {frame_count[0]} frames via __call__")
+                    return original_call(self_writer, frame_rgb, fmt=fmt)
+
+                original_class.__call__ = patched_call
+
+            logger.info(f"{self}: Writer patching complete")
 
             # Start background task to read frames from SDK's writer_queue
             self._frame_reader_running = True
@@ -500,8 +508,25 @@ class DittoTalkingHeadService(FrameProcessor):
         This is where the actual inference happens for the audio chunk.
         """
         logger.debug(f"{self}: Calling SDK.run_chunk with {len(audio_chunk)} samples")
+
+        # Check if worker threads are alive
+        if hasattr(self._sdk, 'workers'):
+            alive_workers = [w.is_alive() for w in self._sdk.workers if hasattr(w, 'is_alive')]
+            logger.info(f"{self}: Worker threads alive: {alive_workers}")
+
+        # Log before run_chunk
+        logger.info(f"{self}: About to call run_chunk with audio shape: {audio_chunk.shape}, chunk_size: {self._chunk_size}")
+
+        # Check SDK state before processing
+        if hasattr(self._sdk, 'n_generated_frames'):
+            logger.info(f"{self}: n_generated_frames before: {self._sdk.n_generated_frames}")
+
         self._sdk.run_chunk(audio_chunk, self._chunk_size)
         logger.debug(f"{self}: SDK.run_chunk completed")
+
+        # Check SDK state after processing
+        if hasattr(self._sdk, 'n_generated_frames'):
+            logger.info(f"{self}: n_generated_frames after: {self._sdk.n_generated_frames}")
 
         # Check if any worker thread encountered an exception
         if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
@@ -521,6 +546,10 @@ class DittoTalkingHeadService(FrameProcessor):
 
         logger.info(f"{self}: SDK pipeline queues: {queue_sizes}")
         logger.info(f"{self}: frame_capture_queue size: {self._frame_capture_queue.qsize()}")
+
+        # Check writer queue specifically
+        if hasattr(self._sdk, 'writer_queue'):
+            logger.info(f"{self}: Writer queue empty: {self._sdk.writer_queue.empty()}, qsize: {self._sdk.writer_queue.qsize()}")
 
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes"""
