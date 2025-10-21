@@ -359,13 +359,17 @@ class DittoTalkingHeadService(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames from the pipeline."""
+        # Log ALL frames to debug what's flowing through
+        if isinstance(frame, (TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame)):
+            logger.warning(f"{self}: 🔍 process_frame received: {type(frame).__name__}")
+
         await super().process_frame(frame, direction)
 
         if isinstance(frame, StartFrame):
             await self.start(frame)
 
         elif isinstance(frame, TTSStartedFrame):
-            logger.info(f"{self}: ===== TTS STARTED - Setting _is_speaking = True =====")
+            logger.warning(f"{self}: ===== TTS STARTED - Setting _is_speaking = True =====")
             self._is_interrupting = False
             self._is_speaking = True  # Set speaking flag immediately when TTS starts
             self._audio_buffer.clear()
