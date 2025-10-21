@@ -406,50 +406,76 @@ class DittoTalkingHeadService(FrameProcessor):
                 break
 
     async def _idle_frame_generator(self):
-        """Generate idle/neutral frames at target FPS when not speaking."""
+        """Generate idle/neutral frames at target FPS when not speaking.
+
+        Continuously feeds silent audio to Ditto SDK to generate neutral frames
+        during idle periods, ensuring smooth video playback even during silence.
+        """
         logger.info(f"{self}: Idle frame generator started (target: {self._target_fps} fps)")
 
+        # Calculate frame interval for target FPS
         frame_interval = 1.0 / self._target_fps  # seconds between frames
+
+        # Ditto generates ~20 fps natively, so calculate how many chunks needed per target frame
+        # Each chunk is 6480 samples at 16kHz = 405ms of audio = ~8 frames at 20fps
+        # To maintain target FPS, we need to feed chunks at the right rate
+        ditto_native_fps = 20  # Ditto's native output FPS
+
         frame_count = 0
+        chunk_count = 0
 
         try:
+            # Wait a bit for SDK to fully initialize
+            await asyncio.sleep(0.5)
+
             while True:
                 start_time = asyncio.get_event_loop().time()
 
                 # Only generate idle frames when not speaking
-                if not self._is_speaking:
-                    if self._last_frame is not None:
-                        # Reuse the last generated frame for idle state
-                        await self._video_frame_queue.put(self._last_frame.copy())
-                        frame_count += 1
+                if not self._is_speaking and self._sdk is not None and self._initialized:
+                    # Generate neutral frame by feeding silent audio to Ditto
+                    # This ensures continuous frame generation during silence
+                    silent_audio = np.zeros(6480, dtype=np.float32)
 
-                        if frame_count == 1:
-                            logger.info(f"{self}: Started generating idle frames at {self._target_fps} fps")
-                        elif frame_count % 100 == 0:
-                            logger.debug(f"{self}: Generated {frame_count} idle frames")
+                    # Add history padding for proper SDK processing
+                    if len(self._audio_history) >= 1920:
+                        padded_audio = np.concatenate([self._audio_history[-1920:], silent_audio])
                     else:
-                        # No frame generated yet - generate a neutral frame
-                        if self._sdk is not None and self._initialized:
-                            # Generate neutral frame with silence
-                            silent_audio = np.zeros(6480, dtype=np.float32)
+                        padding = np.zeros(1920, dtype=np.float32)
+                        padded_audio = np.concatenate([padding, silent_audio])
 
-                            try:
-                                await asyncio.get_event_loop().run_in_executor(
-                                    None,
-                                    self._sdk.run_chunk,
-                                    silent_audio,
-                                    self._chunk_size
-                                )
-                            except Exception as e:
-                                logger.debug(f"{self}: Could not generate initial neutral frame: {e}")
+                    try:
+                        # Run silent chunk through Ditto to generate neutral frames
+                        await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            self._sdk.run_chunk,
+                            padded_audio,
+                            self._chunk_size
+                        )
+
+                        # Update history for next chunk
+                        self._audio_history = silent_audio
+
+                        chunk_count += 1
+
+                        if chunk_count == 1:
+                            logger.info(f"{self}: Started generating idle frames from silent audio")
+                        elif chunk_count % 50 == 0:
+                            logger.debug(f"{self}: Generated {chunk_count} idle audio chunks")
+
+                    except Exception as e:
+                        logger.error(f"{self}: Error generating idle frame: {e}")
+                        import traceback
+                        traceback.print_exc()
 
                 # Sleep to maintain frame rate
+                # Note: Ditto generates multiple frames per chunk, so we feed chunks less frequently
                 elapsed = asyncio.get_event_loop().time() - start_time
-                sleep_time = max(0, frame_interval - elapsed)
+                sleep_time = max(0, frame_interval * (ditto_native_fps / self._target_fps) - elapsed)
                 await asyncio.sleep(sleep_time)
 
         except asyncio.CancelledError:
-            logger.info(f"{self}: Idle frame generator stopped (generated {frame_count} idle frames)")
+            logger.info(f"{self}: Idle frame generator stopped (generated {chunk_count} idle chunks)")
         except Exception as e:
             logger.error(f"{self}: Error in idle frame generator: {e}")
             import traceback
