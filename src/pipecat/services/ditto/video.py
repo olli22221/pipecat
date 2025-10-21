@@ -156,8 +156,18 @@ class DittoTalkingHeadService(FrameProcessor):
             class CapturingVideoWriter(VideoWriterByImageIO):
                 """Custom writer that captures frames before writing to file."""
                 
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.frame_count_internal = 0
+                    logger.info(f"CapturingVideoWriter initialized!")
+                
                 def __call__(self, frame_rgb, fmt="rgb"):
                     """Intercept frame writes and capture them."""
+                    self.frame_count_internal += 1
+                    
+                    if self.frame_count_internal == 1:
+                        logger.info(f"🎉 FIRST FRAME RECEIVED IN WRITER! Shape: {frame_rgb.shape if isinstance(frame_rgb, np.ndarray) else 'not ndarray'}")
+                    
                     if isinstance(frame_rgb, np.ndarray):
                         # Capture frame for streaming
                         frame_capture_queue.put(frame_rgb.copy())
@@ -174,6 +184,11 @@ class DittoTalkingHeadService(FrameProcessor):
                         
                         if frame_count[0] % 25 == 0:
                             logger.info(f"DittoTalkingHeadService#0: Captured {frame_count[0]} frames")
+                        elif frame_count[0] <= 5:
+                            # Log first 5 frames
+                            logger.info(f"DittoTalkingHeadService#0: Captured frame #{frame_count[0]}")
+                    else:
+                        logger.warning(f"Writer received non-ndarray: {type(frame_rgb)}")
                     
                     # Call parent class to write to file
                     return super().__call__(frame_rgb, fmt)
@@ -441,7 +456,7 @@ class DittoTalkingHeadService(FrameProcessor):
                 logger.debug(f"{self}: Batch processed {chunks_processed} chunk(s)")
 
     def _run_chunk(self, audio_chunk: np.ndarray):
-        """Run Ditto's chunk processing in executor."""
+        """Run Ditto's chunk processing (called in executor)."""
         logger.debug(f"{self}: Calling SDK.run_chunk with {len(audio_chunk)} samples")
         logger.info(f"{self}: Audio shape: {audio_chunk.shape}, chunk_size: {self._chunk_size}")
 
@@ -486,6 +501,18 @@ class DittoTalkingHeadService(FrameProcessor):
             traceback.print_exc()
             raise
 
+        # Check for worker exceptions IMMEDIATELY
+        if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
+            logger.error(f"{self}: ⚠️ WORKER EXCEPTION DETECTED: {self._sdk.worker_exception}")
+            import traceback
+            logger.error(f"{self}: Worker exception traceback:")
+            traceback.print_exception(
+                type(self._sdk.worker_exception), 
+                self._sdk.worker_exception, 
+                self._sdk.worker_exception.__traceback__
+            )
+            # Don't raise here, let it continue but log it
+
         # Check queue sizes IMMEDIATELY after run_chunk (before sleep)
         logger.info(f"{self}: Queue sizes IMMEDIATELY after run_chunk:")
         for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
@@ -498,28 +525,36 @@ class DittoTalkingHeadService(FrameProcessor):
                 else:
                     logger.info(f"{self}:   {qname}: {size}")
 
-        # Check for worker exceptions
-        if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
-            logger.error(f"{self}: ⚠️ Worker thread exception detected: {self._sdk.worker_exception}")
-            raise self._sdk.worker_exception
-
-        # Wait for processing
+        # NEW: Wait LONGER and check multiple times
         import time
-        logger.info(f"{self}: Waiting 0.5 seconds for worker threads to process...")
-        time.sleep(0.5)
-
-        # Check queues after short wait
-        logger.info(f"{self}: ===== QUEUE STATUS AFTER 0.5s =====")
-        for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
-                    'decode_f3d_queue', 'putback_queue', 'writer_queue']:
-            if hasattr(self._sdk, qname):
-                q = getattr(self._sdk, qname)
-                size = q.qsize()
-                if size > 0:
-                    logger.warning(f"{self}: ⚠️ {qname}: qsize={size} (HAS DATA!)")
-                else:
-                    logger.info(f"{self}: {qname}: qsize=0 (empty)")
-        logger.info(f"{self}: ===== END QUEUE STATUS =====")
+        logger.info(f"{self}: Monitoring pipeline for 3 seconds...")
+        for check_num in range(6):  # Check every 0.5s for 3 seconds total
+            time.sleep(0.5)
+            
+            # Check all queues
+            queue_status = {}
+            for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
+                        'decode_f3d_queue', 'putback_queue', 'writer_queue']:
+                if hasattr(self._sdk, qname):
+                    queue_status[qname] = getattr(self._sdk, qname).qsize()
+            
+            # Log if any queue has data
+            has_data = any(size > 0 for size in queue_status.values())
+            if has_data:
+                logger.warning(f"{self}: Check #{check_num+1}: Pipeline active! {queue_status}")
+            
+            # Check if frames reached writer_queue
+            if queue_status.get('writer_queue', 0) > 0:
+                logger.info(f"{self}: 🎉 FRAMES REACHED WRITER QUEUE!")
+                break
+            
+            # Check for worker exceptions
+            if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
+                logger.error(f"{self}: Worker exception during monitoring: {self._sdk.worker_exception}")
+                break
+        
+        # Final status
+        logger.info(f"{self}: Final queue status after monitoring: {queue_status}")
 
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes."""
