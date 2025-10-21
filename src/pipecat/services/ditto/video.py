@@ -115,61 +115,176 @@ class DittoTalkingHeadService(FrameProcessor):
             raise ValueError(f"Config file not found: {cfg_pkl}")
 
     async def start(self, frame: StartFrame):
-        """Initialize the Ditto SDK and start background tasks for real-time streaming."""
-        if self._initialized:
-            return
+    """
+    Initialize the Ditto SDK and start background tasks for real-time streaming.
+    
+    This is where the source image is loaded:
+    - SDK.setup() loads the source_image_path (the avatar face)
+    - The SDK processes and prepares the image for animation
+    - This image will be used for all subsequent run_chunk() calls
+    - The same avatar face is animated throughout the session
+    """
+    if self._initialized:
+        return
 
-        logger.info(f"{self}: Initializing Ditto Talking Head service (ONLINE MODE)")
-        logger.info(f"{self}: Source image (avatar): {self._source_image_path}")
-        logger.info(f"{self}: Data root: {self._data_root}")
-        logger.info(f"{self}: Config: {self._cfg_pkl}")
+    logger.info(f"{self}: Initializing Ditto Talking Head service (ONLINE MODE)")
+    logger.info(f"{self}: Source image (avatar): {self._source_image_path}")
+    logger.info(f"{self}: Data root: {self._data_root}")
+    logger.info(f"{self}: Config: {self._cfg_pkl}")
 
-        try:
-            # Import Ditto's StreamSDK
-            import sys
-            sys.path.insert(0, self._ditto_path)
-            from stream_pipeline_online import StreamSDK
+    try:
+        # Import Ditto's StreamSDK from stream_pipeline_online for real-time processing
+        import sys
+        sys.path.insert(0, self._ditto_path)
+        from stream_pipeline_online import StreamSDK
 
-            # Initialize SDK with online_mode=True
-            logger.info(f"{self}: Initializing Ditto StreamSDK in online mode...")
-            self._sdk = StreamSDK(self._cfg_pkl, self._data_root, online_mode=True)
+        # Initialize SDK with online_mode=True for real-time streaming
+        logger.info(f"{self}: Initializing Ditto StreamSDK in online mode...")
+        self._sdk = StreamSDK(self._cfg_pkl, self._data_root, online_mode=True)
 
-            # Setup SDK with source image
-            # In online mode, we don't need output_path or it should be None
-            import tempfile
-            temp_output = os.path.join(tempfile.gettempdir(), f"ditto_temp_{id(self)}.mp4")
+        # Log initial online_mode
+        if hasattr(self._sdk, 'online_mode'):
+            logger.info(f"{self}: SDK online_mode after init: {self._sdk.online_mode}")
+
+        # Setup SDK with source image and temporary output path
+        import tempfile
+        temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
+
+        # CRITICAL: This is where the source image is loaded and processed
+        # The SDK will use this image for all video generation in this session
+        # This also starts the worker threads
+        logger.info(f"{self}: Loading avatar image and setting up SDK...")
+        self._sdk.setup(
+            source_path=self._source_image_path,  # Avatar face image loaded here
+            output_path=temp_output,
+        )
+        logger.info(f"{self}: SDK setup completed")
+
+        # CRITICAL: Force online_mode=True AFTER setup (config file overrides it during setup)
+        # The SDK object must be in online mode for real-time chunk processing
+        self._sdk.online_mode = True
+
+        # Also force online_mode on audio2motion component if it exists
+        if hasattr(self._sdk, 'audio2motion') and hasattr(self._sdk.audio2motion, 'online_mode'):
+            self._sdk.audio2motion.online_mode = True
+            logger.info(f"{self}: Forced audio2motion.online_mode to True")
+
+        logger.info(f"{self}: Forced SDK online_mode to True for real-time streaming")
+        logger.info(f"{self}: Final SDK online_mode: {self._sdk.online_mode}")
+
+        # CHECK IF SDK NEEDS EXPLICIT START/BEGIN CALL
+        logger.info(f"{self}: Checking if SDK needs explicit start...")
+        
+        if hasattr(self._sdk, 'start'):
+            logger.info(f"{self}: Found SDK.start() method, calling it...")
+            try:
+                self._sdk.start()
+                logger.info(f"{self}: SDK.start() completed successfully")
+            except Exception as e:
+                logger.warning(f"{self}: SDK.start() raised exception: {e}")
+        
+        if hasattr(self._sdk, 'start_workers'):
+            logger.info(f"{self}: Found SDK.start_workers() method, calling it...")
+            try:
+                self._sdk.start_workers()
+                logger.info(f"{self}: SDK.start_workers() completed successfully")
+            except Exception as e:
+                logger.warning(f"{self}: SDK.start_workers() raised exception: {e}")
+        
+        if hasattr(self._sdk, 'begin'):
+            logger.info(f"{self}: Found SDK.begin() method, calling it...")
+            try:
+                self._sdk.begin()
+                logger.info(f"{self}: SDK.begin() completed successfully")
+            except Exception as e:
+                logger.warning(f"{self}: SDK.begin() raised exception: {e}")
+
+        # CHECK WORKER THREAD STATUS AFTER SETUP
+        logger.info(f"{self}: ===== POST-SETUP WORKER THREAD STATUS =====")
+        
+        if hasattr(self._sdk, 'workers'):
+            logger.info(f"{self}: Found {len(self._sdk.workers)} worker threads")
+            for i, worker in enumerate(self._sdk.workers):
+                worker_info = f"Worker {i}"
+                if hasattr(worker, 'name'):
+                    worker_info += f" ({worker.name})"
+                
+                if hasattr(worker, 'is_alive'):
+                    is_alive = worker.is_alive()
+                    worker_info += f": alive={is_alive}"
+                    if not is_alive:
+                        logger.error(f"{self}: ⚠️ {worker_info} - THREAD IS DEAD!")
+                    else:
+                        logger.info(f"{self}: ✅ {worker_info} - thread is running")
+                else:
+                    worker_info += f": type={type(worker)}"
+                    logger.info(f"{self}: {worker_info}")
+                
+                if hasattr(worker, 'daemon'):
+                    logger.info(f"{self}:   - daemon={worker.daemon}")
+                
+                if hasattr(worker, '_target'):
+                    logger.info(f"{self}:   - target={worker._target.__name__ if hasattr(worker._target, '__name__') else worker._target}")
+        else:
+            logger.warning(f"{self}: ⚠️ SDK has no 'workers' attribute!")
+            # Try alternative worker management
+            worker_attrs = [attr for attr in dir(self._sdk) if 'worker' in attr.lower() or 'thread' in attr.lower()]
+            if worker_attrs:
+                logger.info(f"{self}: Found alternative worker-related attributes: {worker_attrs}")
+        
+        # Check if SDK has process/daemon/thread manager
+        if hasattr(self._sdk, 'pipeline'):
+            logger.info(f"{self}: SDK has 'pipeline' attribute: {type(self._sdk.pipeline)}")
+        if hasattr(self._sdk, 'started'):
+            logger.info(f"{self}: SDK.started = {self._sdk.started}")
+        if hasattr(self._sdk, 'running'):
+            logger.info(f"{self}: SDK.running = {self._sdk.running}")
+        if hasattr(self._sdk, '_started'):
+            logger.info(f"{self}: SDK._started = {self._sdk._started}")
+        
+        logger.info(f"{self}: ===== END POST-SETUP WORKER THREAD STATUS =====")
+
+        # Diagnose SDK configuration and queues
+        self._diagnose_sdk_queues()
+
+        # Check writer configuration
+        if hasattr(self._sdk, 'writer'):
+            logger.info(f"{self}: ===== WRITER CONFIGURATION =====")
+            writer = self._sdk.writer
+            logger.info(f"{self}: Writer type: {type(writer)}")
+            logger.info(f"{self}: Writer class: {writer.__class__.__name__}")
             
-            logger.info(f"{self}: Setting up SDK with avatar image...")
-            self._sdk.setup(
-                source_path=self._source_image_path,
-                output_path=temp_output,  # SDK might still need this even in online mode
-            )
+            # Check writer attributes
+            writer_attrs = [attr for attr in dir(writer) if not attr.startswith('_')]
+            logger.info(f"{self}: Writer public attributes/methods: {writer_attrs}")
             
-            # Force online_mode=True after setup (config might override it)
-            self._sdk.online_mode = True
-            if hasattr(self._sdk, 'audio2motion') and hasattr(self._sdk.audio2motion, 'online_mode'):
-                self._sdk.audio2motion.online_mode = True
-                logger.info(f"{self}: Forced audio2motion.online_mode to True")
+            if hasattr(writer, 'output_path'):
+                logger.info(f"{self}: Writer output_path: {writer.output_path}")
+            if hasattr(writer, 'fps'):
+                logger.info(f"{self}: Writer fps: {writer.fps}")
+            if hasattr(writer, 'started'):
+                logger.info(f"{self}: Writer started: {writer.started}")
+            
+            logger.info(f"{self}: ===== END WRITER CONFIGURATION =====")
 
-            logger.info(f"{self}: SDK setup completed")
-            logger.info(f"{self}: Final SDK online_mode: {self._sdk.online_mode}")
+        # Start background task to read frames from SDK's internal queues
+        self._frame_reader_running = True
+        self._frame_reader_task = self.create_task(self._read_frames_from_sdk())
+        logger.info(f"{self}: Started frame reader task")
 
-            # Diagnose SDK configuration
-            self._diagnose_sdk_queues()
+        # Start background task to push video frames downstream
+        self._video_playback_task = self.create_task(self._consume_and_push_video())
+        logger.info(f"{self}: Started video playback task")
 
-            # Start background tasks
-            self._frame_reader_running = True
-            self._frame_reader_task = self.create_task(self._read_frames_from_sdk())
-            self._video_playback_task = self.create_task(self._consume_and_push_video())
+        self._initialized = True
+        logger.info(f"{self}: ✅ Ditto service initialized successfully")
+        logger.info(f"{self}: Ready to process audio and generate talking head video")
 
-            self._initialized = True
-            logger.info(f"{self}: Ditto service initialized successfully")
-
-        except Exception as e:
-            logger.error(f"{self}: Failed to initialize Ditto: {e}")
-            import traceback
-            traceback.print_exc()
-            raise RuntimeError(f"Failed to initialize Ditto: {e}")
+    except Exception as e:
+        logger.error(f"{self}: ❌ Failed to initialize Ditto: {e}")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(f"Failed to initialize Ditto: {e}")
 
     def _diagnose_sdk_queues(self):
         """Diagnose SDK configuration to find where frames are being output."""
@@ -381,31 +496,88 @@ class DittoTalkingHeadService(FrameProcessor):
                 logger.debug(f"{self}: Batch processed {chunks_processed} chunk(s)")
 
     def _run_chunk(self, audio_chunk: np.ndarray):
-        """Run Ditto's chunk processing in executor."""
-        logger.debug(f"{self}: Calling SDK.run_chunk with {len(audio_chunk)} samples")
-        logger.info(f"{self}: Audio shape: {audio_chunk.shape}, chunk_size: {self._chunk_size}")
+    """Run Ditto's chunk processing in executor."""
+    logger.debug(f"{self}: Calling SDK.run_chunk with {len(audio_chunk)} samples")
+    logger.info(f"{self}: Audio shape: {audio_chunk.shape}, chunk_size: {self._chunk_size}")
 
+    # CHECK WORKER THREADS STATUS BEFORE PROCESSING
+    logger.info(f"{self}: ===== WORKER THREAD STATUS =====")
+    if hasattr(self._sdk, 'workers'):
+        for i, worker in enumerate(self._sdk.workers):
+            if hasattr(worker, 'is_alive'):
+                is_alive = worker.is_alive()
+                logger.info(f"{self}: Worker {i} ({worker.name if hasattr(worker, 'name') else 'unnamed'}): alive={is_alive}")
+                if not is_alive:
+                    logger.error(f"{self}: ⚠️ Worker {i} is DEAD!")
+            else:
+                logger.info(f"{self}: Worker {i}: {type(worker)}")
+    else:
+        logger.warning(f"{self}: SDK has no 'workers' attribute!")
+    
+    # Check if SDK has a process/daemon/thread manager
+    if hasattr(self._sdk, 'pipeline'):
+        logger.info(f"{self}: SDK has pipeline attribute")
+    if hasattr(self._sdk, 'started'):
+        logger.info(f"{self}: SDK started: {self._sdk.started}")
+    if hasattr(self._sdk, 'running'):
+        logger.info(f"{self}: SDK running: {self._sdk.running}")
+    
+    logger.info(f"{self}: ===== END WORKER THREAD STATUS =====")
+
+    # Log what's about to be processed
+    logger.info(f"{self}: Calling run_chunk with:")
+    logger.info(f"{self}:   - audio_chunk.shape: {audio_chunk.shape}")
+    logger.info(f"{self}:   - audio_chunk.dtype: {audio_chunk.dtype}")
+    logger.info(f"{self}:   - audio_chunk min/max: {audio_chunk.min():.4f} / {audio_chunk.max():.4f}")
+    logger.info(f"{self}:   - chunk_size: {self._chunk_size}")
+    logger.info(f"{self}:   - SDK online_mode: {getattr(self._sdk, 'online_mode', 'N/A')}")
+
+    # Call run_chunk
+    try:
         self._sdk.run_chunk(audio_chunk, self._chunk_size)
-        logger.debug(f"{self}: SDK.run_chunk completed")
+        logger.debug(f"{self}: SDK.run_chunk completed successfully")
+    except Exception as e:
+        logger.error(f"{self}: SDK.run_chunk raised exception: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
-        # Wait for frames to propagate through pipeline
-        import time
-        time.sleep(1.0)
+    # Check for worker exceptions
+    if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
+        logger.error(f"{self}: ⚠️ Worker thread exception detected: {self._sdk.worker_exception}")
+        raise self._sdk.worker_exception
 
-        # Check ALL queues to find where frames are
-        logger.info(f"{self}: ===== QUEUE STATUS AFTER run_chunk =====")
-        for attr_name in dir(self._sdk):
-            try:
-                attr = getattr(self._sdk, attr_name)
-                if hasattr(attr, 'qsize'):
-                    qsize = attr.qsize()
-                    if qsize > 0:
-                        logger.warning(f"{self}: ⚠️ {attr_name} HAS DATA! qsize={qsize}")
-                    else:
-                        logger.info(f"{self}: {attr_name}: qsize=0 (empty)")
-            except:
-                pass
-        logger.info(f"{self}: ===== END QUEUE STATUS =====")
+    # Wait longer for processing
+    import time
+    logger.info(f"{self}: Waiting 2 seconds for worker threads to process...")
+    time.sleep(2.0)
+
+    # Check ALL queues in detail
+    logger.info(f"{self}: ===== QUEUE STATUS AFTER run_chunk =====")
+    for attr_name in dir(self._sdk):
+        try:
+            attr = getattr(self._sdk, attr_name)
+            if hasattr(attr, 'qsize'):
+                qsize = attr.qsize()
+                if qsize > 0:
+                    logger.warning(f"{self}: ⚠️ {attr_name} HAS DATA! qsize={qsize}")
+                    # Try to peek at what's in the queue
+                    if hasattr(attr, 'queue'):
+                        logger.info(f"{self}:   Queue contents preview: {list(attr.queue)[:3]}")
+                else:
+                    logger.info(f"{self}: {attr_name}: qsize=0 (empty)")
+        except Exception as e:
+            pass
+    logger.info(f"{self}: ===== END QUEUE STATUS =====")
+
+    # Check if run_chunk actually did anything
+    if hasattr(self._sdk, 'n_generated_frames'):
+        logger.info(f"{self}: n_generated_frames: {self._sdk.n_generated_frames}")
+    
+    # Check internal counters
+    for attr_name in ['n_chunks_processed', 'frame_count', 'total_frames']:
+        if hasattr(self._sdk, attr_name):
+            logger.info(f"{self}: {attr_name}: {getattr(self._sdk, attr_name)}")
 
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes."""
