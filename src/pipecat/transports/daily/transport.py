@@ -648,7 +648,11 @@ class DailyTransportClient(EventHandler):
         """
         if not frame.transport_destination and self._camera:
             logger.debug(f"{self}: Writing video frame to camera (size: {frame.size})")
-            self._camera.write_frame(frame.image)
+            # Convert numpy array to bytes if needed
+            image_data = frame.image
+            if hasattr(image_data, 'tobytes'):
+                image_data = image_data.tobytes()
+            self._camera.write_frame(image_data)
             return True
         else:
             if frame.transport_destination:
