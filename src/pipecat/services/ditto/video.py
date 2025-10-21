@@ -123,6 +123,7 @@ class DittoTalkingHeadService(FrameProcessor):
         self._frame_reader_task: Optional[asyncio.Task] = None
         self._audio_processing_task: Optional[asyncio.Task] = None
         self._video_queue = asyncio.Queue()
+        self._frame_capture_queue = queue_module.Queue()  # Thread-safe queue for SDK's writer callback
         self._frame_reader_running = False
 
         # State tracking
@@ -165,11 +166,10 @@ class DittoTalkingHeadService(FrameProcessor):
         logger.info(f"{self}: Config: {self._cfg_pkl}")
 
         try:
-            # Import Ditto's StreamSDK from stream_pipeline_offline
-            # (it has online_mode support built in)
+            # Import Ditto's StreamSDK from stream_pipeline_online for real-time processing
             import sys
             sys.path.insert(0, self._ditto_path)
-            from stream_pipeline_offline import StreamSDK
+            from stream_pipeline_online import StreamSDK
 
             # Initialize SDK
             logger.info(f"{self}: Initializing Ditto StreamSDK...")
@@ -180,13 +180,6 @@ class DittoTalkingHeadService(FrameProcessor):
                 logger.info(f"{self}: SDK online_mode: {self._sdk.online_mode}")
             else:
                 logger.info(f"{self}: SDK initialized (online_mode attribute not available)")
-
-            # Debug: check for writer_queue
-            logger.debug(f"{self}: SDK attributes: {dir(self._sdk)}")
-            if hasattr(self._sdk, 'writer_queue'):
-                logger.info(f"{self}: SDK has writer_queue available")
-            else:
-                logger.warning(f"{self}: SDK does NOT have writer_queue attribute")
 
             # Setup SDK with source image and temporary output path
             import tempfile
@@ -199,6 +192,21 @@ class DittoTalkingHeadService(FrameProcessor):
                 source_path=self._source_image_path,  # Avatar face image loaded here
                 output_path=temp_output,
             )
+
+            # Replace SDK's writer with our custom frame capturer
+            # The SDK's writer is called for each generated frame
+            # Instead of writing to file, we'll queue frames for streaming
+            def custom_writer(frame_rgb, fmt="rgb"):
+                """Custom writer that captures frames instead of writing to file"""
+                try:
+                    # Put frame in our thread-safe queue for async processing
+                    if isinstance(frame_rgb, np.ndarray):
+                        self._frame_capture_queue.put(frame_rgb)
+                except Exception as e:
+                    logger.error(f"{self}: Error in custom writer: {e}")
+
+            self._sdk.writer = custom_writer
+            logger.info(f"{self}: Replaced SDK writer with custom frame capturer")
 
             # Start background task to read frames from SDK's writer_queue
             self._frame_reader_running = True
@@ -486,27 +494,20 @@ class DittoTalkingHeadService(FrameProcessor):
 
     async def _read_frames_from_sdk(self):
         """
-        Background task that reads generated frames from Ditto SDK's writer_queue.
-        This taps into the SDK's internal queue where frames are put before writing to file.
+        Background task that reads generated frames from our custom frame capture queue.
+        The SDK's writer callback puts frames into this queue as they're generated.
         """
         logger.info(f"{self}: Frame reader task started")
 
         try:
             while self._frame_reader_running:
-                # Check if SDK is ready
-                if not self._sdk or not hasattr(self._sdk, 'writer_queue'):
-                    if self._sdk and not hasattr(self._sdk, 'writer_queue'):
-                        logger.warning(f"{self}: SDK exists but has no writer_queue attribute")
-                    await asyncio.sleep(0.1)
-                    continue
-
                 try:
-                    # Try to get frame from SDK's writer queue
+                    # Try to get frame from our capture queue
                     # Run in executor since queue.get() is blocking
                     loop = asyncio.get_event_loop()
                     frame_rgb = await loop.run_in_executor(
                         None,
-                        lambda: self._sdk.writer_queue.get(timeout=0.1)
+                        lambda: self._frame_capture_queue.get(timeout=0.1)
                     )
 
                     if frame_rgb is None:
