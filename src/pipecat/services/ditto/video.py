@@ -13,6 +13,7 @@ from typing import Optional
 import numpy as np
 from loguru import logger
 
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -84,19 +85,19 @@ class DittoTalkingHeadService(FrameProcessor):
         
         # Initialize ALL queues and state variables
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
-        self._video_queue = asyncio.Queue()        # For video frames with timestamps (used in process_frame)
-        
-        # Locks for thread safety
-        self._processing_lock = asyncio.Lock()     # Prevents concurrent audio processing
-        
+        self._audio_queue = None  # Will be initialized when audio task is created
+
         # SDK and initialization state
         self._sdk = None
         self._initialized = False
-        
+
         # Audio processing state
-        self._audio_buffer = np.array([], dtype=np.float32)
+        self._audio_buffer = bytearray()
         self._audio_history = np.array([], dtype=np.float32)
-        self._audio_processing_task = None  # For tracking async audio processing
+        self._audio_task = None  # Audio processing task
+        self._event_id = None  # Track current utterance
+        self._is_interrupting = False  # Interrupt flag
+        self._resampler = create_stream_resampler()  # Audio resampler
         
         # Frame reading/playback state
         self._frame_reader_running = False
@@ -145,66 +146,6 @@ class DittoTalkingHeadService(FrameProcessor):
                 self._sdk.audio2motion.online_mode = True
 
             logger.info(f"{self}: Final SDK online_mode: {self._sdk.online_mode}")
-
-            # ==================== GPU DIAGNOSTICS ====================
-            import torch
-            logger.info(f"{self}: ===== GPU DIAGNOSTICS =====")
-            logger.info(f"{self}: PyTorch CUDA available: {torch.cuda.is_available()}")
-            if torch.cuda.is_available():
-                logger.info(f"{self}: GPU: {torch.cuda.get_device_name(0)}")
-                logger.info(f"{self}: Initial VRAM: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB")
-
-            # Explore SDK structure
-            logger.info(f"{self}: SDK attributes: {dir(self._sdk)}")
-
-            if hasattr(self._sdk, 'audio2motion'):
-                a2m = self._sdk.audio2motion
-                logger.info(f"{self}: audio2motion attributes: {dir(a2m)}")
-                
-                # Try to find any model-like attributes
-                for attr in dir(a2m):
-                    if 'model' in attr.lower() or 'net' in attr.lower():
-                        obj = getattr(a2m, attr)
-                        logger.info(f"{self}: Found attribute '{attr}': {type(obj)}")
-                        
-                        # Check if it has parameters (is a PyTorch model)
-                        if hasattr(obj, 'parameters'):
-                            try:
-                                device = next(obj.parameters()).device
-                                logger.info(f"{self}: ⚠️ {attr} is on: {device}")
-                                
-                                if device.type == 'cpu':
-                                    logger.warning(f"{self}: Moving {attr} to GPU...")
-                                    setattr(a2m, attr, obj.cuda())
-                                    device = next(getattr(a2m, attr).parameters()).device
-                                    logger.info(f"{self}: ✅ {attr} now on: {device}")
-                            except Exception as e:
-                                logger.error(f"{self}: Error checking {attr}: {e}")
-
-            # Check all SDK components
-            for component_name in dir(self._sdk):
-                if not component_name.startswith('_'):
-                    component = getattr(self._sdk, component_name)
-                    if hasattr(component, '__dict__'):
-                        # Check if component has model attributes
-                        for attr in dir(component):
-                            if 'model' in attr.lower() or 'net' in attr.lower():
-                                obj = getattr(component, attr, None)
-                                if obj is not None and hasattr(obj, 'parameters'):
-                                    try:
-                                        device = next(obj.parameters()).device
-                                        logger.info(f"{self}: {component_name}.{attr} on: {device}")
-                                        if device.type == 'cpu':
-                                            logger.warning(f"{self}: Moving {component_name}.{attr} to GPU...")
-                                            setattr(component, attr, obj.cuda())
-                                            logger.info(f"{self}: ✅ Moved {component_name}.{attr} to GPU")
-                                    except Exception as e:
-                                        pass  # Silent fail for non-model objects
-
-            if torch.cuda.is_available():
-                logger.info(f"{self}: After loading VRAM: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB")
-            logger.info(f"{self}: ===== END GPU DIAGNOSTICS =====")
-            # ==================== END GPU DIAGNOSTICS ====================
 
             # Setup SDK paths
             import tempfile
@@ -263,20 +204,6 @@ class DittoTalkingHeadService(FrameProcessor):
             # Store the frame capture queue
             self._frame_capture_queue = frame_capture_queue
 
-            # Check worker threads
-            logger.info(f"{self}: ===== POST-SETUP WORKER THREAD STATUS =====")
-            if hasattr(self._sdk, 'thread_list'):
-                logger.info(f"{self}: Found {len(self._sdk.thread_list)} worker threads")
-                for i, thread in enumerate(self._sdk.thread_list):
-                    is_alive = thread.is_alive()
-                    thread_name = thread.name if hasattr(thread, 'name') else f"Thread-{i}"
-                    logger.info(f"{self}: {'✅' if is_alive else '⚠️'} Worker {i} ({thread_name}): {'ALIVE' if is_alive else 'DEAD'}")
-            
-            logger.info(f"{self}: ===== END POST-SETUP WORKER THREAD STATUS =====")
-
-            # Diagnose queues
-            self._diagnose_sdk_queues()
-
             # Start background tasks
             self._frame_reader_running = True
             self._frame_reader_task = self.create_task(self._read_frames_from_sdk())
@@ -284,6 +211,9 @@ class DittoTalkingHeadService(FrameProcessor):
 
             self._video_playback_task = self.create_task(self._consume_and_push_video())
             logger.info(f"{self}: Started video playback task")
+
+            # Start audio processing task
+            await self._create_audio_task()
 
             self._initialized = True
             logger.info(f"{self}: ✅ Ditto service initialized successfully")
@@ -294,49 +224,12 @@ class DittoTalkingHeadService(FrameProcessor):
             traceback.print_exc()
             raise RuntimeError(f"Failed to initialize Ditto: {e}")
 
-    def _diagnose_sdk_queues(self):
-        """Diagnose SDK configuration to find where frames are being output."""
-        logger.info(f"{self}: ===== SDK DIAGNOSTICS =====")
-        
-        # Check online mode
-        logger.info(f"{self}: SDK online_mode: {getattr(self._sdk, 'online_mode', 'N/A')}")
-        
-        # Check thread_list (worker threads)
-        if hasattr(self._sdk, 'thread_list'):
-            logger.info(f"{self}: Number of worker threads: {len(self._sdk.thread_list)}")
-        
-        # Check all queue attributes
-        queue_attrs = ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
-                    'decode_f3d_queue', 'putback_queue', 'writer_queue']
-        logger.info(f"{self}: Checking pipeline queues...")
-        
-        for attr_name in queue_attrs:
-            if hasattr(self._sdk, attr_name):
-                attr = getattr(self._sdk, attr_name)
-                logger.info(f"{self}:   - {attr_name}: qsize={attr.qsize()}, empty={attr.empty()}")
-            else:
-                logger.warning(f"{self}:   - {attr_name}: NOT FOUND")
-        
-        # Check writer
-        if hasattr(self._sdk, 'writer'):
-            writer = self._sdk.writer
-            logger.info(f"{self}: Writer type: {type(writer)}")
-            logger.info(f"{self}: Writer class: {writer.__class__.__name__}")
-        
-        logger.info(f"{self}: ===== END DIAGNOSTICS =====")
-
     async def stop(self, frame: EndFrame):
         """Clean up resources"""
         self._frame_reader_running = False
 
         # Cancel tasks
-        if self._audio_processing_task:
-            self._audio_processing_task.cancel()
-            try:
-                await self._audio_processing_task
-            except asyncio.CancelledError:
-                pass
-            self._audio_processing_task = None
+        await self._cancel_audio_task()
 
         if self._frame_reader_task:
             self._frame_reader_task.cancel()
@@ -354,23 +247,89 @@ class DittoTalkingHeadService(FrameProcessor):
                 pass
             self._video_playback_task = None
 
-        self._audio_buffer = []
+        self._audio_buffer = bytearray()
         self._sdk = None
         self._initialized = False
 
     async def cancel(self, frame: CancelFrame):
         """Cancel any ongoing operations"""
-        self._interrupted = True
+        self._is_interrupting = True
+        await self._cancel_audio_task()
+        self._audio_buffer = bytearray()
 
-        if self._audio_processing_task:
-            self._audio_processing_task.cancel()
+    async def _create_audio_task(self):
+        """Create the audio processing task if it doesn't exist."""
+        if not self._audio_task:
+            self._audio_queue = asyncio.Queue()
+            self._audio_task = self.create_task(self._audio_task_handler())
+            logger.info(f"{self}: Audio processing task created")
+
+    async def _cancel_audio_task(self):
+        """Cancel the audio processing task if it exists."""
+        if self._audio_task:
+            self._audio_task.cancel()
             try:
-                await self._audio_processing_task
+                await self._audio_task
             except asyncio.CancelledError:
                 pass
-            self._audio_processing_task = None
+            self._audio_task = None
+            logger.debug(f"{self}: Audio task cancelled")
 
-        self._audio_buffer = []
+    async def _audio_task_handler(self):
+        """Handle processing audio frames from the queue.
+
+        Continuously processes audio frames, accumulates them in a buffer,
+        and sends chunks to Ditto SDK. Uses timeout to detect end of speech.
+        """
+        VAD_STOP_SECS = 0.5  # Time to wait before finalizing audio
+
+        while True:
+            try:
+                # Wait for audio frames with timeout
+                frame = await asyncio.wait_for(
+                    self._audio_queue.get(),
+                    timeout=VAD_STOP_SECS
+                )
+
+                if self._is_interrupting:
+                    logger.debug(f"{self}: Interrupting, breaking audio task")
+                    break
+
+                if isinstance(frame, TTSAudioRawFrame):
+                    # Starting new inference
+                    if self._event_id is None:
+                        self._event_id = str(frame.id)
+                        logger.info(f"{self}: Starting new utterance {self._event_id}")
+
+                    # Resample audio to 16kHz
+                    audio_resampled = await self._resampler.resample(
+                        frame.audio, frame.sample_rate, 16000
+                    )
+
+                    # Resampler returns bytes, so extend buffer directly
+                    self._audio_buffer.extend(audio_resampled)
+
+                    # Process chunks as they accumulate
+                    chunk_size_bytes = 6480 * 2  # 6480 samples * 2 bytes per sample
+                    while len(self._audio_buffer) >= chunk_size_bytes:
+                        chunk_bytes = bytes(self._audio_buffer[:chunk_size_bytes])
+                        self._audio_buffer = self._audio_buffer[chunk_size_bytes:]
+
+                        # Convert back to float32 for SDK
+                        chunk_array = np.frombuffer(chunk_bytes, dtype=np.int16)
+                        chunk_float = chunk_array.astype(np.float32) / 32768.0
+
+                        await self._process_single_chunk(chunk_float)
+
+                self._audio_queue.task_done()
+
+            except asyncio.TimeoutError:
+                # No audio received for VAD_STOP_SECS - finalize
+                if self._event_id is not None:
+                    logger.info(f"{self}: Timeout detected, finalizing utterance {self._event_id}")
+                    await self._finalize_audio()
+                    self._event_id = None
+                    self._audio_buffer.clear()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames from the pipeline."""
@@ -381,299 +340,131 @@ class DittoTalkingHeadService(FrameProcessor):
 
         elif isinstance(frame, TTSStartedFrame):
             logger.info(f"{self}: Starting new TTS utterance")
-            self._interrupted = False
-            self._audio_buffer = np.array([], dtype=np.float32)  # Use numpy array!
-            self._current_num_frames = 0
+            self._is_interrupting = False
+            self._audio_buffer.clear()
+            # Note: event_id will be set when first audio frame arrives
 
         elif isinstance(frame, TTSAudioRawFrame):
-            if not self._initialized or self._interrupted:
+            if not self._initialized or self._is_interrupting:
                 pass
             else:
-                # Resample audio to 16kHz
-                audio_array = np.frombuffer(frame.audio, dtype=np.int16)
-
-                if frame.sample_rate != 16000:
-                    audio_float = audio_array.astype(np.float32) / 32768.0
-                    audio_resampled = librosa.resample(
-                        audio_float,
-                        orig_sr=frame.sample_rate,
-                        target_sr=16000
-                    )
-                else:
-                    audio_resampled = audio_array.astype(np.float32) / 32768.0
-
-                # Add to buffer (numpy array, not list!)
-                self._audio_buffer = np.concatenate([self._audio_buffer, audio_resampled])
-
-                # Process chunks continuously as they arrive
-                while len(self._audio_buffer) >= 6480:
-                    chunk = self._audio_buffer[:6480]
-                    self._audio_buffer = self._audio_buffer[6480:]
-                    
-                    # Process chunk immediately (don't wait!)
-                    logger.debug(f"{self}: Processing chunk of {len(chunk)} samples immediately")
-                    await self._process_single_chunk(chunk)
+                # Queue audio for processing
+                await self._audio_queue.put(frame)
 
         elif isinstance(frame, TTSStoppedFrame):
-            logger.info(f"{self}: TTS stopped, processing remaining audio")
-            # Process any remaining audio in buffer
-            if len(self._audio_buffer) > 0:
-                await self._finalize_audio()
+            # The timeout in _audio_task_handler will handle finalization
+            logger.debug(f"{self}: TTS stopped")
 
         elif isinstance(frame, (InterruptionFrame, UserStartedSpeakingFrame)):
             logger.info(f"{self}: Interruption detected, clearing state")
-            self._interrupted = True
-            self._audio_buffer = np.array([], dtype=np.float32)
-            while not self._video_queue.empty():
-                try:
-                    self._video_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+            await self._handle_interruption()
 
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self.stop(frame)
 
         await self.push_frame(frame, direction)
 
+    async def _handle_interruption(self):
+        """Handle user interruption by stopping audio processing and restarting."""
+        self._is_interrupting = True
+        self._audio_buffer.clear()
+        self._event_id = None
+
+        # Cancel and restart audio task
+        await self._cancel_audio_task()
+        self._is_interrupting = False
+        await self._create_audio_task()
+
+        # Clear video queue
+        while not self._video_frame_queue.empty():
+            try:
+                self._video_frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
     async def _process_single_chunk(self, audio_chunk: np.ndarray):
         """Process a single 6480-sample chunk immediately."""
-        async with self._processing_lock:
-            # Add history padding (1920 samples from previous chunk)
-            if len(self._audio_history) >= 1920:
-                padded_audio = np.concatenate([self._audio_history[-1920:], audio_chunk])
-            else:
-                # First chunk - pad with zeros
-                padding = np.zeros(1920, dtype=np.float32)
-                padded_audio = np.concatenate([padding, audio_chunk])
-            
-            logger.debug(f"{self}: Running SDK chunk (total: {len(padded_audio)} samples)")
-            
-            # Run SDK processing in executor (non-blocking)
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                self._sdk.run_chunk,
-                padded_audio,
-                self._chunk_size
-            )
-            
-            # Update history for next chunk
-            self._audio_history = audio_chunk
-            
-    async def _process_audio_chunks(self):
-        """Process accumulated audio chunks using Ditto's run_chunk() method."""
-        if not self._sdk or self._interrupted:
-            return
-
-        async with self._processing_lock:
-            stride_samples = self._chunk_size[1] * 640
-            split_len = int(sum(self._chunk_size) * 0.04 * 16000) + 80
-
-            chunks_processed = 0
-            while len(self._audio_buffer) >= split_len and not self._interrupted:
-                try:
-                    if not self._sdk_initialized_for_utterance:
-                        history_samples = self._chunk_size[0] * 640
-                        if history_samples > 0:
-                            padding = np.zeros((history_samples,), dtype=np.float32)
-                            self._audio_buffer = padding.tolist() + self._audio_buffer
-                            logger.debug(f"{self}: Added {history_samples} samples of history padding")
-
-                        estimated_audio_length = len(self._audio_buffer) / 16000
-                        num_frames = math.ceil(estimated_audio_length * 25)
-
-                        logger.info(f"{self}: Setting up SDK for ~{num_frames} frames")
-
-                        self._sdk.setup_Nd(
-                            N_d=num_frames,
-                            fade_in=-1,
-                            fade_out=-1,
-                            ctrl_info={}
-                        )
-                        self._sdk_initialized_for_utterance = True
-                        self._current_num_frames = num_frames
-
-                    audio_chunk = np.array(self._audio_buffer[:split_len], dtype=np.float32)
-
-                    if len(audio_chunk) < split_len:
-                        audio_chunk = np.pad(
-                            audio_chunk,
-                            (0, split_len - len(audio_chunk)),
-                            mode="constant"
-                        )
-
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(
-                        None,
-                        self._run_chunk,
-                        audio_chunk
-                    )
-
-                    self._audio_buffer = self._audio_buffer[stride_samples:]
-                    chunks_processed += 1
-
-                    logger.debug(
-                        f"{self}: Processed chunk #{chunks_processed} (window={split_len}, stride={stride_samples}), "
-                        f"{len(self._audio_buffer)} samples remaining"
-                    )
-
-                except Exception as e:
-                    logger.error(f"{self}: Error processing audio chunk: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    break
-
-            if chunks_processed > 0:
-                logger.debug(f"{self}: Batch processed {chunks_processed} chunk(s)")
-
-    def _run_chunk(self, audio_chunk: np.ndarray):
-        """Run Ditto's chunk processing (called in executor)."""
-        logger.debug(f"{self}: Calling SDK.run_chunk with {len(audio_chunk)} samples")
-        logger.info(f"{self}: Audio shape: {audio_chunk.shape}, chunk_size: {self._chunk_size}")
-
-        # CHECK WORKER THREAD STATUS BEFORE PROCESSING
-        logger.info(f"{self}: ===== WORKER THREAD STATUS =====")
-        if hasattr(self._sdk, 'thread_list'):
-            logger.info(f"{self}: Found {len(self._sdk.thread_list)} threads in thread_list")
-            for i, thread in enumerate(self._sdk.thread_list):
-                if hasattr(thread, 'is_alive'):
-                    is_alive = thread.is_alive()
-                    thread_name = thread.name if hasattr(thread, 'name') else f"Thread-{i}"
-                    if is_alive:
-                        logger.info(f"{self}: ✅ Thread {i} ({thread_name}): ALIVE")
-                    else:
-                        logger.error(f"{self}: ⚠️ Thread {i} ({thread_name}): DEAD!")
-            
-            # Check if stop_event is set
-            if hasattr(self._sdk, 'stop_event'):
-                logger.info(f"{self}: SDK stop_event.is_set(): {self._sdk.stop_event.is_set()}")
+        # Add history padding (1920 samples from previous chunk)
+        if len(self._audio_history) >= 1920:
+            padded_audio = np.concatenate([self._audio_history[-1920:], audio_chunk])
         else:
-            logger.warning(f"{self}: SDK has no 'thread_list' attribute!")
-        
-        logger.info(f"{self}: ===== END WORKER THREAD STATUS =====")
+            # First chunk - pad with zeros
+            padding = np.zeros(1920, dtype=np.float32)
+            padded_audio = np.concatenate([padding, audio_chunk])
 
-        # Check queue sizes BEFORE run_chunk
-        logger.info(f"{self}: Queue sizes BEFORE run_chunk:")
-        for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
-                    'decode_f3d_queue', 'putback_queue', 'writer_queue']:
-            if hasattr(self._sdk, qname):
-                q = getattr(self._sdk, qname)
-                logger.info(f"{self}:   {qname}: {q.qsize()}")
+        logger.debug(f"{self}: Running SDK chunk (total: {len(padded_audio)} samples)")
 
-        logger.info(f"{self}: Calling run_chunk...")
-        
-        # Call run_chunk
-        try:
-            self._sdk.run_chunk(audio_chunk, self._chunk_size)
-            logger.debug(f"{self}: SDK.run_chunk completed successfully")
-        except Exception as e:
-            logger.error(f"{self}: SDK.run_chunk raised exception: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+        # Run SDK processing in executor (non-blocking)
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            self._sdk.run_chunk,
+            padded_audio,
+            self._chunk_size
+        )
 
-        # Check for worker exceptions IMMEDIATELY
-        if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
-            logger.error(f"{self}: ⚠️ WORKER EXCEPTION DETECTED: {self._sdk.worker_exception}")
-            import traceback
-            logger.error(f"{self}: Worker exception traceback:")
-            traceback.print_exception(
-                type(self._sdk.worker_exception), 
-                self._sdk.worker_exception, 
-                self._sdk.worker_exception.__traceback__
-            )
-            # Don't raise here, let it continue but log it
-
-        # Check queue sizes IMMEDIATELY after run_chunk (before sleep)
-        logger.info(f"{self}: Queue sizes IMMEDIATELY after run_chunk:")
-        for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
-                    'decode_f3d_queue', 'putback_queue', 'writer_queue']:
-            if hasattr(self._sdk, qname):
-                q = getattr(self._sdk, qname)
-                size = q.qsize()
-                if size > 0:
-                    logger.warning(f"{self}:   ⚠️ {qname}: {size} (HAS DATA!)")
-                else:
-                    logger.info(f"{self}:   {qname}: {size}")
-
-        # NEW: Wait LONGER and check multiple times
-        import time
-        logger.info(f"{self}: Monitoring pipeline for 3 seconds...")
-        for check_num in range(6):  # Check every 0.5s for 3 seconds total
-            time.sleep(0.5)
-            
-            # Check all queues
-            queue_status = {}
-            for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
-                        'decode_f3d_queue', 'putback_queue', 'writer_queue']:
-                if hasattr(self._sdk, qname):
-                    queue_status[qname] = getattr(self._sdk, qname).qsize()
-            
-            # Log if any queue has data
-            has_data = any(size > 0 for size in queue_status.values())
-            if has_data:
-                logger.warning(f"{self}: Check #{check_num+1}: Pipeline active! {queue_status}")
-            
-            # Check if frames reached writer_queue
-            if queue_status.get('writer_queue', 0) > 0:
-                logger.info(f"{self}: 🎉 FRAMES REACHED WRITER QUEUE!")
-                break
-            
-            # Check for worker exceptions
-            if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
-                logger.error(f"{self}: Worker exception during monitoring: {self._sdk.worker_exception}")
-                break
-        
-        # Final status
-        logger.info(f"{self}: Final queue status after monitoring: {queue_status}")
+        # Update history for next chunk
+        self._audio_history = audio_chunk
 
     async def _finalize_audio(self):
         """Process any remaining audio in the buffer after TTS stops."""
         if len(self._audio_buffer) == 0:
             return
-            
-        logger.info(f"{self}: Finalizing audio processing, buffer has {len(self._audio_buffer)} samples")
-        
-        # Add future context padding
+
+        num_samples = len(self._audio_buffer) // 2  # Convert bytes to samples
+        logger.info(f"{self}: Finalizing audio processing, buffer has {num_samples} samples ({len(self._audio_buffer)} bytes)")
+
+        # Add future context padding (1280 samples = 2560 bytes)
         padding_samples = 1280  # 2 frames * 640
         logger.info(f"{self}: Adding {padding_samples} samples of future padding")
-        
-        # Pad with last sample repeated (or zeros if buffer empty)
-        if len(self._audio_buffer) > 0:
-            last_sample = self._audio_buffer[-1]
-            future_padding = np.full(padding_samples, last_sample, dtype=np.float32)
-            self._audio_buffer = np.concatenate([self._audio_buffer, future_padding])  # ← Changed from extend
-        
-        logger.info(f"{self}: After padding, buffer has {len(self._audio_buffer)} samples")
-        
+
+        # Get last sample from buffer for padding
+        if len(self._audio_buffer) >= 2:
+            # Extract last int16 sample
+            last_int16 = np.frombuffer(self._audio_buffer[-2:], dtype=np.int16)[0]
+            # Create padding
+            padding_array = np.full(padding_samples, last_int16, dtype=np.int16)
+            self._audio_buffer.extend(padding_array.tobytes())
+
+        num_samples_padded = len(self._audio_buffer) // 2
+        logger.info(f"{self}: After padding, buffer has {num_samples_padded} samples")
+
         # Process remaining chunks
-        logger.info(f"{self}: Processing remaining chunks (chunk_size=6480)")
-        
+        chunk_size_bytes = 6480 * 2  # 6480 samples * 2 bytes per sample
         iteration = 0
-        while len(self._audio_buffer) >= 6480:
+
+        while len(self._audio_buffer) >= chunk_size_bytes:
             iteration += 1
-            logger.debug(f"{self}: Iteration {iteration}: buffer size = {len(self._audio_buffer)}")
-            
-            chunk = self._audio_buffer[:6480]
-            self._audio_buffer = self._audio_buffer[6480:]  # ← Changed from list slicing (still works)
-            
-            # Process this chunk
-            await self._process_single_chunk(chunk)
-        
+            logger.debug(f"{self}: Iteration {iteration}: buffer size = {len(self._audio_buffer) // 2} samples")
+
+            # Extract chunk
+            chunk_bytes = bytes(self._audio_buffer[:chunk_size_bytes])
+            self._audio_buffer = self._audio_buffer[chunk_size_bytes:]
+
+            # Convert to float32 for SDK
+            chunk_array = np.frombuffer(chunk_bytes, dtype=np.int16)
+            chunk_float = chunk_array.astype(np.float32) / 32768.0
+
+            await self._process_single_chunk(chunk_float)
+
         # Process final partial chunk if any remains
         if len(self._audio_buffer) > 0:
-            logger.info(f"{self}: Processing final partial chunk ({len(self._audio_buffer)} samples)")
+            remaining_samples = len(self._audio_buffer) // 2
+            logger.info(f"{self}: Processing final partial chunk ({remaining_samples} samples)")
+
+            # Convert what we have
+            chunk_array = np.frombuffer(bytes(self._audio_buffer), dtype=np.int16)
+            chunk_float = chunk_array.astype(np.float32) / 32768.0
+
             # Pad to minimum size if needed
-            if len(self._audio_buffer) < 6480:
-                padding_needed = 6480 - len(self._audio_buffer)
-                final_padding = np.full(padding_needed, self._audio_buffer[-1], dtype=np.float32)
-                final_chunk = np.concatenate([self._audio_buffer, final_padding])
-            else:
-                final_chunk = self._audio_buffer
-            
-            await self._process_single_chunk(final_chunk)
-        
+            if len(chunk_float) < 6480:
+                padding_needed = 6480 - len(chunk_float)
+                final_padding = np.full(padding_needed, chunk_float[-1], dtype=np.float32)
+                chunk_float = np.concatenate([chunk_float, final_padding])
+
+            await self._process_single_chunk(chunk_float)
+
         # Clear buffer
-        self._audio_buffer = np.array([], dtype=np.float32)
+        self._audio_buffer.clear()
         logger.info(f"{self}: Finalization complete")
 
     async def _read_frames_from_sdk(self):
