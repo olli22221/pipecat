@@ -153,46 +153,54 @@ class DittoTalkingHeadService(FrameProcessor):
             if torch.cuda.is_available():
                 logger.info(f"{self}: GPU: {torch.cuda.get_device_name(0)}")
                 logger.info(f"{self}: Initial VRAM: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB")
-            
-            # Check Ditto model device
+
+            # Explore SDK structure
+            logger.info(f"{self}: SDK attributes: {dir(self._sdk)}")
+
             if hasattr(self._sdk, 'audio2motion'):
                 a2m = self._sdk.audio2motion
+                logger.info(f"{self}: audio2motion attributes: {dir(a2m)}")
                 
-                # Find the actual model
-                if hasattr(a2m, 'audio2motion_model'):
-                    model = a2m.audio2motion_model
-                    device = next(model.parameters()).device
-                    logger.info(f"{self}: ⚠️ Audio2Motion model is on: {device}")
-                    
-                    # Force to GPU if not already
-                    if device.type == 'cpu':
-                        logger.warning(f"{self}: Model is on CPU! Moving to GPU...")
-                        a2m.audio2motion_model = a2m.audio2motion_model.cuda()
-                        logger.info(f"{self}: ✅ Model moved to GPU")
+                # Try to find any model-like attributes
+                for attr in dir(a2m):
+                    if 'model' in attr.lower() or 'net' in attr.lower():
+                        obj = getattr(a2m, attr)
+                        logger.info(f"{self}: Found attribute '{attr}': {type(obj)}")
                         
-                        # Verify
-                        device = next(a2m.audio2motion_model.parameters()).device
-                        logger.info(f"{self}: Verified device: {device}")
-                
-                # Check other models if they exist
-                if hasattr(a2m, 'hubert_model'):
-                    device = next(a2m.hubert_model.parameters()).device
-                    logger.info(f"{self}: Hubert model on: {device}")
-                    if device.type == 'cpu':
-                        a2m.hubert_model = a2m.hubert_model.cuda()
-                        logger.info(f"{self}: Moved Hubert to GPU")
-            
-            # Check other pipeline components
-            for attr_name in ['motion_stitch', 'f3d_warper', 'f3d_decoder']:
-                if hasattr(self._sdk, attr_name):
-                    component = getattr(self._sdk, attr_name)
-                    if hasattr(component, 'model'):
-                        device = next(component.model.parameters()).device
-                        logger.info(f"{self}: {attr_name} model on: {device}")
-                        if device.type == 'cpu':
-                            component.model = component.model.cuda()
-                            logger.info(f"{self}: Moved {attr_name} to GPU")
-            
+                        # Check if it has parameters (is a PyTorch model)
+                        if hasattr(obj, 'parameters'):
+                            try:
+                                device = next(obj.parameters()).device
+                                logger.info(f"{self}: ⚠️ {attr} is on: {device}")
+                                
+                                if device.type == 'cpu':
+                                    logger.warning(f"{self}: Moving {attr} to GPU...")
+                                    setattr(a2m, attr, obj.cuda())
+                                    device = next(getattr(a2m, attr).parameters()).device
+                                    logger.info(f"{self}: ✅ {attr} now on: {device}")
+                            except Exception as e:
+                                logger.error(f"{self}: Error checking {attr}: {e}")
+
+            # Check all SDK components
+            for component_name in dir(self._sdk):
+                if not component_name.startswith('_'):
+                    component = getattr(self._sdk, component_name)
+                    if hasattr(component, '__dict__'):
+                        # Check if component has model attributes
+                        for attr in dir(component):
+                            if 'model' in attr.lower() or 'net' in attr.lower():
+                                obj = getattr(component, attr, None)
+                                if obj is not None and hasattr(obj, 'parameters'):
+                                    try:
+                                        device = next(obj.parameters()).device
+                                        logger.info(f"{self}: {component_name}.{attr} on: {device}")
+                                        if device.type == 'cpu':
+                                            logger.warning(f"{self}: Moving {component_name}.{attr} to GPU...")
+                                            setattr(component, attr, obj.cuda())
+                                            logger.info(f"{self}: ✅ Moved {component_name}.{attr} to GPU")
+                                    except Exception as e:
+                                        pass  # Silent fail for non-model objects
+
             if torch.cuda.is_available():
                 logger.info(f"{self}: After loading VRAM: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB")
             logger.info(f"{self}: ===== END GPU DIAGNOSTICS =====")
