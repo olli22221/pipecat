@@ -146,6 +146,7 @@ async def main():
             video_out_enabled=True,  # Enable video output
             video_out_width=1440,  # Match Ditto's output size
             video_out_height=1920,  # Match Ditto's output size
+            video_out_framerate=30,  # 30 fps for smooth video
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
             join_timeout=30,  # Increase timeout for Ditto initialization (default: 10s)

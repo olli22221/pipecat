@@ -60,6 +60,8 @@ class DittoTalkingHeadService(FrameProcessor):
         chunk_size: Audio chunk size tuple (history, current, future) frames
                    - Default (3, 5, 2) = ~200ms latency, 50% overlap
         save_frames_dir: Optional directory path to save generated frames as PNG files
+        target_fps: Target frame rate for idle frame generation (default: 30 fps)
+                   - Ensures smooth video even during silence
         **kwargs: Additional arguments passed to FrameProcessor
     """
 
@@ -72,16 +74,18 @@ class DittoTalkingHeadService(FrameProcessor):
         source_image_path: str,
         chunk_size: tuple = (3, 5, 2),
         save_frames_dir: Optional[str] = None,
+        target_fps: int = 30,
         **kwargs
     ):
         super().__init__(**kwargs)
-        
+
         self._ditto_path = ditto_path
         self._data_root = data_root
         self._cfg_pkl = cfg_pkl
         self._source_image_path = source_image_path
         self._chunk_size = chunk_size
         self._save_frames_dir = save_frames_dir
+        self._target_fps = target_fps
         
         # Initialize ALL queues and state variables
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
@@ -104,6 +108,11 @@ class DittoTalkingHeadService(FrameProcessor):
         self._frame_reader_task = None
         self._video_playback_task = None
         self._frame_capture_queue = None  # Will be set in start()
+
+        # Idle frame generation
+        self._idle_frame_task = None
+        self._last_frame = None  # Cache last generated frame for idle state
+        self._is_speaking = False  # Track if currently generating speech frames
         
         # Create save directory if specified
         if self._save_frames_dir:
@@ -215,6 +224,10 @@ class DittoTalkingHeadService(FrameProcessor):
             # Start audio processing task
             await self._create_audio_task()
 
+            # Start idle frame generation task
+            self._idle_frame_task = self.create_task(self._idle_frame_generator())
+            logger.info(f"{self}: Started idle frame generator at {self._target_fps} fps")
+
             self._initialized = True
             logger.info(f"{self}: ✅ Ditto service initialized successfully")
 
@@ -246,6 +259,14 @@ class DittoTalkingHeadService(FrameProcessor):
             except asyncio.CancelledError:
                 pass
             self._video_playback_task = None
+
+        if self._idle_frame_task:
+            self._idle_frame_task.cancel()
+            try:
+                await self._idle_frame_task
+            except asyncio.CancelledError:
+                pass
+            self._idle_frame_task = None
 
         self._audio_buffer = bytearray()
         self._sdk = None
@@ -299,6 +320,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     # Starting new inference
                     if self._event_id is None:
                         self._event_id = str(frame.id)
+                        self._is_speaking = True
                         logger.info(f"{self}: Starting new utterance {self._event_id}")
 
                     # Resample audio to 16kHz
@@ -329,6 +351,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     logger.info(f"{self}: Timeout detected, finalizing utterance {self._event_id}")
                     await self._finalize_audio()
                     self._event_id = None
+                    self._is_speaking = False
                     self._audio_buffer.clear()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -381,6 +404,56 @@ class DittoTalkingHeadService(FrameProcessor):
                 self._video_frame_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    async def _idle_frame_generator(self):
+        """Generate idle/neutral frames at target FPS when not speaking."""
+        logger.info(f"{self}: Idle frame generator started (target: {self._target_fps} fps)")
+
+        frame_interval = 1.0 / self._target_fps  # seconds between frames
+        frame_count = 0
+
+        try:
+            while True:
+                start_time = asyncio.get_event_loop().time()
+
+                # Only generate idle frames when not speaking
+                if not self._is_speaking:
+                    if self._last_frame is not None:
+                        # Reuse the last generated frame for idle state
+                        await self._video_frame_queue.put(self._last_frame.copy())
+                        frame_count += 1
+
+                        if frame_count == 1:
+                            logger.info(f"{self}: Started generating idle frames at {self._target_fps} fps")
+                        elif frame_count % 100 == 0:
+                            logger.debug(f"{self}: Generated {frame_count} idle frames")
+                    else:
+                        # No frame generated yet - generate a neutral frame
+                        if self._sdk is not None and self._initialized:
+                            # Generate neutral frame with silence
+                            silent_audio = np.zeros(6480, dtype=np.float32)
+
+                            try:
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None,
+                                    self._sdk.run_chunk,
+                                    silent_audio,
+                                    self._chunk_size
+                                )
+                            except Exception as e:
+                                logger.debug(f"{self}: Could not generate initial neutral frame: {e}")
+
+                # Sleep to maintain frame rate
+                elapsed = asyncio.get_event_loop().time() - start_time
+                sleep_time = max(0, frame_interval - elapsed)
+                await asyncio.sleep(sleep_time)
+
+        except asyncio.CancelledError:
+            logger.info(f"{self}: Idle frame generator stopped (generated {frame_count} idle frames)")
+        except Exception as e:
+            logger.error(f"{self}: Error in idle frame generator: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _process_single_chunk(self, audio_chunk: np.ndarray):
         """Process a single 6480-sample chunk immediately."""
@@ -486,12 +559,15 @@ class DittoTalkingHeadService(FrameProcessor):
                         break
                     
                     frames_read += 1
-                    
+
                     if frames_read == 1:
                         logger.info(f"{self}: 🎉 FIRST FRAME CAPTURED!")
                     elif frames_read % 10 == 0:
                         logger.info(f"{self}: Read {frames_read} frames from SDK")
-                    
+
+                    # Cache the last frame for idle state
+                    self._last_frame = frame.copy()
+
                     # Add to video playback queue
                     await self._video_frame_queue.put(frame)
                     logger.debug(f"{self}: Added frame to video queue (qsize={self._video_frame_queue.qsize()})")
