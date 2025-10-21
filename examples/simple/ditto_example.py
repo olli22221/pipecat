@@ -143,10 +143,9 @@ async def main():
         params=DailyParams(
             audio_out_enabled=True,
             audio_out_sample_rate=24000,
-            video_out_enabled=True,  # CRITICAL: Enable video output from transport
-            camera_out_enabled=True,  # Enable camera device
-            camera_out_width=1440,  # Match Ditto's output size
-            camera_out_height=1920,  # Match Ditto's output size
+            video_out_enabled=True,  # Enable video output
+            video_out_width=1440,  # Match Ditto's output size
+            video_out_height=1920,  # Match Ditto's output size
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
             join_timeout=30,  # Increase timeout for Ditto initialization (default: 10s)
