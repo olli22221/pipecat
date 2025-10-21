@@ -113,7 +113,10 @@ class DittoTalkingHeadService(FrameProcessor):
         self._idle_frame_task = None
         self._last_frame = None  # Cache last generated frame for idle state
         self._is_speaking = False  # Track if currently generating speech frames
-        
+
+        # SDK access lock to prevent concurrent run_chunk calls
+        self._sdk_lock = asyncio.Lock()
+
         # Create save directory if specified
         if self._save_frames_dir:
             os.makedirs(self._save_frames_dir, exist_ok=True)
@@ -350,6 +353,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     logger.info(f"{self}: Timeout detected, finalizing utterance {self._event_id}")
                     await self._finalize_audio()
                     self._event_id = None
+                    logger.info(f"{self}: ===== SPEECH FINALIZED - Setting _is_speaking = False =====")
                     self._is_speaking = False
                     self._audio_buffer.clear()
 
@@ -361,7 +365,7 @@ class DittoTalkingHeadService(FrameProcessor):
             await self.start(frame)
 
         elif isinstance(frame, TTSStartedFrame):
-            logger.info(f"{self}: Starting new TTS utterance")
+            logger.info(f"{self}: ===== TTS STARTED - Setting _is_speaking = True =====")
             self._is_interrupting = False
             self._is_speaking = True  # Set speaking flag immediately when TTS starts
             self._audio_buffer.clear()
@@ -439,7 +443,7 @@ class DittoTalkingHeadService(FrameProcessor):
                 if not self._is_speaking and self._sdk is not None and self._initialized:
                     # Log when transitioning from speaking to idle
                     if was_speaking:
-                        logger.info(f"{self}: Transitioning to IDLE mode - starting silent audio generation")
+                        logger.info(f"{self}: ===== Transitioning to IDLE mode - starting silent audio generation =====")
                         was_speaking = False
 
                     # Generate neutral frame by feeding silent audio to Ditto
@@ -455,12 +459,15 @@ class DittoTalkingHeadService(FrameProcessor):
 
                     try:
                         # Run silent chunk through Ditto to generate neutral frames
-                        await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            self._sdk.run_chunk,
-                            padded_audio,
-                            self._chunk_size
-                        )
+                        # Use lock to prevent interference with speech audio processing
+                        async with self._sdk_lock:
+                            logger.debug(f"{self}: IDLE generator acquired SDK lock, feeding silent audio")
+                            await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                self._sdk.run_chunk,
+                                padded_audio,
+                                self._chunk_size
+                            )
 
                         # Update history for next chunk
                         self._audio_history = silent_audio
@@ -479,6 +486,7 @@ class DittoTalkingHeadService(FrameProcessor):
                 else:
                     # Currently speaking - track state for transition logging
                     if not was_speaking:
+                        logger.info(f"{self}: ===== IDLE mode paused - bot is speaking (_is_speaking = {self._is_speaking}) =====")
                         was_speaking = True
 
                 # Sleep to maintain frame rate
@@ -504,15 +512,18 @@ class DittoTalkingHeadService(FrameProcessor):
             padding = np.zeros(1920, dtype=np.float32)
             padded_audio = np.concatenate([padding, audio_chunk])
 
-        logger.debug(f"{self}: Running SDK chunk (total: {len(padded_audio)} samples)")
+        logger.debug(f"{self}: SPEECH processor waiting for SDK lock...")
 
         # Run SDK processing in executor (non-blocking)
-        await asyncio.get_event_loop().run_in_executor(
-            None,
-            self._sdk.run_chunk,
-            padded_audio,
-            self._chunk_size
-        )
+        # Use lock to prevent interference with idle frame generator
+        async with self._sdk_lock:
+            logger.debug(f"{self}: SPEECH processor acquired SDK lock, feeding speech audio")
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._sdk.run_chunk,
+                padded_audio,
+                self._chunk_size
+            )
 
         # Update history for next chunk
         self._audio_history = audio_chunk
