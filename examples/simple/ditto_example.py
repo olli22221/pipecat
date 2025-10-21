@@ -23,6 +23,7 @@ SETUP REQUIRED:
 4. Set environment variables:
    export DITTO_PATH="./ditto-talkinghead"
    export DITTO_SOURCE_IMAGE="./my_avatar.png"  # Your avatar image path
+   export DITTO_SAVE_FRAMES_DIR="./ditto_frames"  # Optional: save frames to disk
 
 Example structure:
   your_project/
@@ -100,10 +101,10 @@ async def main():
 
     # Ditto configuration
     # IMPORTANT: Update these paths to match your Ditto installation
-    # NOTE: Use an "online" config file for real-time streaming (e.g., v0.4_hubert_cfg_trt_online.pkl)
+    # NOTE: Use PyTorch config for flexibility with variable input sizes (avoids ONNX shape mismatch)
     ditto_path = os.getenv("DITTO_PATH", "./ditto-talkinghead")
     ditto_data_root = os.getenv("DITTO_DATA_ROOT", "./checkpoints/ditto_trt_Ampere_Plus")
-    ditto_cfg_pkl = os.getenv("DITTO_CFG_PKL", "./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl")
+    ditto_cfg_pkl = os.getenv("DITTO_CFG_PKL", "./checkpoints/ditto_cfg/v0.4_hubert_cfg_pytorch_online.pkl")
     source_image = os.getenv("DITTO_SOURCE_IMAGE", "./example/image.png")
 
     # Validate Ditto paths
@@ -168,12 +169,17 @@ async def main():
     # 2. Processes audio chunks as they arrive from TTS
     # 3. Generates video frames that are synchronized with the audio
     # 4. The source_image is the avatar face that gets animated
+
+    # Optional: Save frames to disk for debugging/offline video creation
+    save_frames_dir = os.getenv("DITTO_SAVE_FRAMES_DIR", "./ditto_frames")
+
     ditto = DittoTalkingHeadService(
         ditto_path=ditto_path,
         data_root=ditto_data_root,
         cfg_pkl=ditto_cfg_pkl,
         source_image_path=source_image,  # Your avatar face image
         chunk_size=(3, 5, 2),  # (history, current, future) frames - must match model training
+        save_frames_dir=save_frames_dir,  # Save frames to this directory
     )
 
     # Create context
