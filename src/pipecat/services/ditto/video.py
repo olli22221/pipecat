@@ -196,17 +196,27 @@ class DittoTalkingHeadService(FrameProcessor):
             # Replace SDK's writer with our custom frame capturer
             # The SDK's writer is called for each generated frame
             # Instead of writing to file, we'll queue frames for streaming
+            frame_count = [0]  # Use list to allow mutation in nested function
+
             def custom_writer(frame_rgb, fmt="rgb"):
                 """Custom writer that captures frames instead of writing to file"""
                 try:
                     # Put frame in our thread-safe queue for async processing
                     if isinstance(frame_rgb, np.ndarray):
                         self._frame_capture_queue.put(frame_rgb)
+                        frame_count[0] += 1
+                        if frame_count[0] % 25 == 0:  # Log every second
+                            logger.debug(f"{self}: Custom writer captured {frame_count[0]} frames")
+                    else:
+                        logger.warning(f"{self}: Writer called with non-ndarray: {type(frame_rgb)}")
                 except Exception as e:
                     logger.error(f"{self}: Error in custom writer: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             self._sdk.writer = custom_writer
             logger.info(f"{self}: Replaced SDK writer with custom frame capturer")
+            logger.debug(f"{self}: SDK writer type: {type(self._sdk.writer)}")
 
             # Start background task to read frames from SDK's writer_queue
             self._frame_reader_running = True
@@ -473,7 +483,9 @@ class DittoTalkingHeadService(FrameProcessor):
         Run Ditto's chunk processing (called in executor).
         This is where the actual inference happens for the audio chunk.
         """
+        logger.debug(f"{self}: Calling SDK.run_chunk with {len(audio_chunk)} samples")
         self._sdk.run_chunk(audio_chunk, self._chunk_size)
+        logger.debug(f"{self}: SDK.run_chunk completed")
 
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes"""
