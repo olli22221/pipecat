@@ -147,94 +147,100 @@ class DittoTalkingHeadService(FrameProcessor):
             temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
 
             # CRITICAL: Create a custom writer class that captures frames
-            # This must be done BEFORE setup() because worker threads start during setup()
-            
-            frame_capture_queue = queue_module.Queue()  # Use the module-level queue
+            frame_capture_queue = queue_module.Queue()
             frame_save_dir = self._save_frames_dir
             frame_count = [0]
+            
+            logger.info(f"{self}: Creating CapturingVideoWriter class...")
             
             class CapturingVideoWriter(VideoWriterByImageIO):
                 """Custom writer that captures frames before writing to file."""
                 
                 def __init__(self, *args, **kwargs):
+                    logger.info("🎬 CapturingVideoWriter.__init__() called!")
+                    logger.info(f"   args: {args}")
+                    logger.info(f"   kwargs: {kwargs}")
                     super().__init__(*args, **kwargs)
                     self.frame_count_internal = 0
-                    logger.info(f"CapturingVideoWriter initialized!")
+                    logger.info(f"✅ CapturingVideoWriter initialized successfully!")
                 
                 def __call__(self, frame_rgb, fmt="rgb"):
                     """Intercept frame writes and capture them."""
                     self.frame_count_internal += 1
                     
                     if self.frame_count_internal == 1:
-                        logger.info(f"🎉 FIRST FRAME RECEIVED IN WRITER! Shape: {frame_rgb.shape if isinstance(frame_rgb, np.ndarray) else 'not ndarray'}")
+                        logger.info(f"🎉 FIRST FRAME RECEIVED IN WRITER!")
+                        logger.info(f"   Frame type: {type(frame_rgb)}")
+                        logger.info(f"   Frame shape: {frame_rgb.shape if isinstance(frame_rgb, np.ndarray) else 'N/A'}")
                     
                     if isinstance(frame_rgb, np.ndarray):
-                        # Capture frame for streaming
                         frame_capture_queue.put(frame_rgb.copy())
                         frame_count[0] += 1
                         
-                        # Save frame to disk if directory specified
                         if frame_save_dir:
-                            frame_path = os.path.join(
-                                frame_save_dir,
-                                f"frame_{frame_count[0]:06d}.png"
-                            )
+                            frame_path = os.path.join(frame_save_dir, f"frame_{frame_count[0]:06d}.png")
                             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                             cv2.imwrite(frame_path, frame_bgr)
                         
                         if frame_count[0] % 25 == 0:
                             logger.info(f"DittoTalkingHeadService#0: Captured {frame_count[0]} frames")
                         elif frame_count[0] <= 5:
-                            # Log first 5 frames
                             logger.info(f"DittoTalkingHeadService#0: Captured frame #{frame_count[0]}")
                     else:
                         logger.warning(f"Writer received non-ndarray: {type(frame_rgb)}")
                     
-                    # Call parent class to write to file
                     return super().__call__(frame_rgb, fmt)
             
             # Monkey-patch the VideoWriterByImageIO class BEFORE setup
             import core.atomic_components.writer as writer_module
             original_writer_class = writer_module.VideoWriterByImageIO
+            
+            logger.info(f"{self}: Original writer class: {original_writer_class}")
+            logger.info(f"{self}: About to replace with: {CapturingVideoWriter}")
+            
             writer_module.VideoWriterByImageIO = CapturingVideoWriter
             
-            logger.info(f"{self}: Patched VideoWriterByImageIO class for frame capture")
+            logger.info(f"{self}: Writer class replaced in module")
+            logger.info(f"{self}: Module VideoWriterByImageIO is now: {writer_module.VideoWriterByImageIO}")
 
-            # NOW call setup - worker threads will use our custom writer
-            logger.info(f"{self}: Loading avatar image and setting up SDK...")
+            # NOW call setup
+            logger.info(f"{self}: Calling SDK.setup()...")
             self._sdk.setup(
                 source_path=self._source_image_path,
                 output_path=temp_output,
             )
-            logger.info(f"{self}: SDK setup completed")
+            logger.info(f"{self}: SDK.setup() completed")
 
-            # Restore original writer class to avoid affecting other instances
+            # Check what writer was actually created
+            logger.info(f"{self}: Checking SDK writer after setup...")
+            if hasattr(self._sdk, 'writer'):
+                logger.info(f"{self}: SDK writer type: {type(self._sdk.writer)}")
+                logger.info(f"{self}: SDK writer class name: {self._sdk.writer.__class__.__name__}")
+                logger.info(f"{self}: Is instance of CapturingVideoWriter: {isinstance(self._sdk.writer, CapturingVideoWriter)}")
+            else:
+                logger.error(f"{self}: SDK has no 'writer' attribute after setup!")
+
+            # Restore original writer class
             writer_module.VideoWriterByImageIO = original_writer_class
 
-            # Store the frame capture queue as an instance variable
+            # Store the frame capture queue
             self._frame_capture_queue = frame_capture_queue
 
-            # CHECK WORKER THREAD STATUS
+            # Check worker threads
             logger.info(f"{self}: ===== POST-SETUP WORKER THREAD STATUS =====")
-            
             if hasattr(self._sdk, 'thread_list'):
                 logger.info(f"{self}: Found {len(self._sdk.thread_list)} worker threads")
                 for i, thread in enumerate(self._sdk.thread_list):
                     is_alive = thread.is_alive()
                     thread_name = thread.name if hasattr(thread, 'name') else f"Thread-{i}"
-                    if is_alive:
-                        logger.info(f"{self}: ✅ Worker {i} ({thread_name}): ALIVE")
-                    else:
-                        logger.error(f"{self}: ⚠️ Worker {i} ({thread_name}): DEAD!")
-            else:
-                logger.warning(f"{self}: SDK has no 'thread_list' attribute!")
+                    logger.info(f"{self}: {'✅' if is_alive else '⚠️'} Worker {i} ({thread_name}): {'ALIVE' if is_alive else 'DEAD'}")
             
             logger.info(f"{self}: ===== END POST-SETUP WORKER THREAD STATUS =====")
 
             # Diagnose queues
             self._diagnose_sdk_queues()
 
-            # Start background tasks to read captured frames
+            # Start background tasks
             self._frame_reader_running = True
             self._frame_reader_task = self.create_task(self._read_frames_from_sdk())
             logger.info(f"{self}: Started frame reader task")
@@ -244,7 +250,6 @@ class DittoTalkingHeadService(FrameProcessor):
 
             self._initialized = True
             logger.info(f"{self}: ✅ Ditto service initialized successfully")
-            logger.info(f"{self}: Ready to process audio and generate talking head video")
 
         except Exception as e:
             logger.error(f"{self}: ❌ Failed to initialize Ditto: {e}")
