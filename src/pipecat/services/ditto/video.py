@@ -654,26 +654,55 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Push video frames downstream at the correct frame rate."""
+        """Consume video frames from queue and push to Daily."""
         logger.info(f"{self}: Video playback task started")
-
+        
+        frames_pushed = 0
         try:
-            frame_count = 0
             while True:
-                frame, frame_duration = await self._video_queue.get()
-
-                await self.push_frame(frame)
-                frame_count += 1
-
-                if frame_count % 25 == 0:
-                    logger.debug(f"{self}: Pushed {frame_count} video frames downstream")
-
-                await asyncio.sleep(frame_duration)
-
+                try:
+                    # Get frame from the queue (with timeout to check for cancellation)
+                    frame = await asyncio.wait_for(
+                        self._video_frame_queue.get(),
+                        timeout=0.1
+                    )
+                    
+                    if frame is None:
+                        logger.info(f"{self}: Received None, stopping video playback")
+                        break
+                    
+                    frames_pushed += 1
+                    
+                    if frames_pushed == 1:
+                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
+                    elif frames_pushed % 10 == 0:
+                        logger.info(f"{self}: Pushed {frames_pushed} frames to Daily")
+                    
+                    # Create OutputImageRawFrame for Daily
+                    output_frame = OutputImageRawFrame(
+                        image=frame,
+                        size=(frame.shape[1], frame.shape[0]),  # (width, height)
+                        format="RGB"
+                    )
+                    
+                    # Push to pipeline (this sends to Daily)
+                    await self.push_frame(output_frame)
+                    logger.debug(f"{self}: Pushed frame {frames_pushed} to Daily")
+                    
+                except asyncio.TimeoutError:
+                    # No frame available, continue waiting
+                    continue
+                except Exception as e:
+                    logger.error(f"{self}: Error pushing video frame: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    break
+        
         except asyncio.CancelledError:
             logger.info(f"{self}: Video playback task cancelled")
-            raise
         except Exception as e:
             logger.error(f"{self}: Error in video playback: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            logger.info(f"{self}: Video playback finished (pushed {frames_pushed} frames)")
