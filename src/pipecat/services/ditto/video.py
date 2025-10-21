@@ -320,7 +320,6 @@ class DittoTalkingHeadService(FrameProcessor):
                     # Starting new inference
                     if self._event_id is None:
                         self._event_id = str(frame.id)
-                        self._is_speaking = True
                         logger.info(f"{self}: Starting new utterance {self._event_id}")
 
                     # Resample audio to 16kHz
@@ -364,6 +363,7 @@ class DittoTalkingHeadService(FrameProcessor):
         elif isinstance(frame, TTSStartedFrame):
             logger.info(f"{self}: Starting new TTS utterance")
             self._is_interrupting = False
+            self._is_speaking = True  # Set speaking flag immediately when TTS starts
             self._audio_buffer.clear()
             # Note: event_id will be set when first audio frame arrives
 
@@ -376,7 +376,9 @@ class DittoTalkingHeadService(FrameProcessor):
 
         elif isinstance(frame, TTSStoppedFrame):
             # The timeout in _audio_task_handler will handle finalization
-            logger.debug(f"{self}: TTS stopped")
+            # Note: We don't set _is_speaking = False here because there may still be
+            # audio in the buffer being processed. The timeout handler will set it to False.
+            logger.debug(f"{self}: TTS stopped, waiting for audio buffer to drain")
 
         elif isinstance(frame, (InterruptionFrame, UserStartedSpeakingFrame)):
             logger.info(f"{self}: Interruption detected, clearing state")
@@ -423,6 +425,7 @@ class DittoTalkingHeadService(FrameProcessor):
 
         frame_count = 0
         chunk_count = 0
+        was_speaking = False  # Track state changes for logging
 
         try:
             # Wait a bit for SDK to fully initialize
@@ -432,7 +435,13 @@ class DittoTalkingHeadService(FrameProcessor):
                 start_time = asyncio.get_event_loop().time()
 
                 # Only generate idle frames when not speaking
+                # This prevents interference with speech-driven frame generation
                 if not self._is_speaking and self._sdk is not None and self._initialized:
+                    # Log when transitioning from speaking to idle
+                    if was_speaking:
+                        logger.info(f"{self}: Transitioning to IDLE mode - starting silent audio generation")
+                        was_speaking = False
+
                     # Generate neutral frame by feeding silent audio to Ditto
                     # This ensures continuous frame generation during silence
                     silent_audio = np.zeros(6480, dtype=np.float32)
@@ -467,6 +476,10 @@ class DittoTalkingHeadService(FrameProcessor):
                         logger.error(f"{self}: Error generating idle frame: {e}")
                         import traceback
                         traceback.print_exc()
+                else:
+                    # Currently speaking - track state for transition logging
+                    if not was_speaking:
+                        was_speaking = True
 
                 # Sleep to maintain frame rate
                 # Note: Ditto generates multiple frames per chunk, so we feed chunks less frequently
