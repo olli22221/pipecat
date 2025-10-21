@@ -524,11 +524,7 @@ class DittoTalkingHeadService(FrameProcessor):
 
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes"""
-        # Process all remaining chunks (with overlap)
-        stride_samples = self._chunk_size[1] * 640
-
-        while len(self._audio_buffer) >= stride_samples and not self._interrupted:
-            await self._process_audio_chunks()
+        logger.info(f"{self}: Finalizing audio processing, buffer has {len(self._audio_buffer)} samples")
 
         # Add future padding to flush the pipeline
         # The SDK needs 'future' frames worth of audio to output the last frames
@@ -537,16 +533,49 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Adding {future_samples} samples of future padding to flush pipeline")
             future_padding = np.zeros((future_samples,), dtype=np.float32)
             self._audio_buffer.extend(future_padding.tolist())
+            logger.info(f"{self}: After padding, buffer has {len(self._audio_buffer)} samples")
 
-            # Process remaining chunks with the padding
-            while len(self._audio_buffer) >= stride_samples and not self._interrupted:
-                await self._process_audio_chunks()
+        # Process all remaining chunks
+        # Note: _process_audio_chunks has its own while loop that processes chunks >= split_len
+        stride_samples = self._chunk_size[1] * 640
+        split_len = int(sum(self._chunk_size) * 0.04 * 16000) + 80
 
-        # Process final partial chunk if any remains
-        if len(self._audio_buffer) > 0 and not self._interrupted:
-            split_len = int(sum(self._chunk_size) * 0.04 * 16000) + 80
-            # Final chunk - will be padded to split_len in _process_audio_chunks
+        logger.info(f"{self}: Processing remaining chunks (stride={stride_samples}, split_len={split_len})")
+
+        # Keep processing until buffer is too small for even a stride
+        iteration = 0
+        while len(self._audio_buffer) >= stride_samples and not self._interrupted:
+            iteration += 1
+            buffer_size_before = len(self._audio_buffer)
+            logger.debug(f"{self}: Iteration {iteration}: buffer size = {buffer_size_before}")
+
             await self._process_audio_chunks()
+
+            buffer_size_after = len(self._audio_buffer)
+
+            # If buffer didn't change, force process the final partial chunk
+            if buffer_size_before == buffer_size_after:
+                logger.info(f"{self}: Buffer unchanged at {buffer_size_after} samples, processing final partial chunk")
+                # Manually process final chunk by temporarily lowering requirement
+                if buffer_size_after > 0:
+                    async with self._processing_lock:
+                        # Pad buffer to split_len
+                        audio_chunk = np.array(self._audio_buffer, dtype=np.float32)
+                        if len(audio_chunk) < split_len:
+                            audio_chunk = np.pad(
+                                audio_chunk,
+                                (0, split_len - len(audio_chunk)),
+                                mode="constant"
+                            )
+
+                        logger.info(f"{self}: Processing final padded chunk of {len(audio_chunk)} samples")
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, self._run_chunk, audio_chunk)
+
+                        # Clear buffer
+                        self._audio_buffer = []
+                        logger.info(f"{self}: Final chunk processed, buffer cleared")
+                break
 
         logger.info(f"{self}: Audio processing finalized")
 
