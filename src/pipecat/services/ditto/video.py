@@ -322,9 +322,8 @@ class DittoTalkingHeadService(FrameProcessor):
         elif isinstance(frame, TTSStartedFrame):
             logger.info(f"{self}: Starting new TTS utterance")
             self._interrupted = False
-            self._audio_buffer = []
+            self._audio_buffer = np.array([], dtype=np.float32)  # Use numpy array!
             self._current_num_frames = 0
-            self._sdk_initialized_for_utterance = False
 
         elif isinstance(frame, TTSAudioRawFrame):
             if not self._initialized or self._interrupted:
@@ -343,23 +342,28 @@ class DittoTalkingHeadService(FrameProcessor):
                 else:
                     audio_resampled = audio_array.astype(np.float32) / 32768.0
 
-                self._audio_buffer.extend(audio_resampled.tolist())
+                # Add to buffer (numpy array, not list!)
+                self._audio_buffer = np.concatenate([self._audio_buffer, audio_resampled])
 
-                # Trigger processing if we have enough audio
-                split_len = int(sum(self._chunk_size) * 0.04 * 16000) + 80
-                if len(self._audio_buffer) >= split_len:
-                    if self._audio_processing_task is None or self._audio_processing_task.done():
-                        self._audio_processing_task = self.create_task(self._process_audio_chunks())
+                # Process chunks continuously as they arrive
+                while len(self._audio_buffer) >= 6480:
+                    chunk = self._audio_buffer[:6480]
+                    self._audio_buffer = self._audio_buffer[6480:]
+                    
+                    # Process chunk immediately (don't wait!)
+                    logger.debug(f"{self}: Processing chunk of {len(chunk)} samples immediately")
+                    await self._process_single_chunk(chunk)
 
         elif isinstance(frame, TTSStoppedFrame):
             logger.info(f"{self}: TTS stopped, processing remaining audio")
-            await self._finalize_audio()
+            # Process any remaining audio in buffer
+            if len(self._audio_buffer) > 0:
+                await self._finalize_audio()
 
         elif isinstance(frame, (InterruptionFrame, UserStartedSpeakingFrame)):
             logger.info(f"{self}: Interruption detected, clearing state")
             self._interrupted = True
-            self._audio_buffer = []
-            self._sdk_initialized_for_utterance = False
+            self._audio_buffer = np.array([], dtype=np.float32)
             while not self._video_queue.empty():
                 try:
                     self._video_queue.get_nowait()
@@ -371,6 +375,30 @@ class DittoTalkingHeadService(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
+    async def _process_single_chunk(self, audio_chunk: np.ndarray):
+        """Process a single 6480-sample chunk immediately."""
+        async with self._processing_lock:
+            # Add history padding (1920 samples from previous chunk)
+            if len(self._audio_history) >= 1920:
+                padded_audio = np.concatenate([self._audio_history[-1920:], audio_chunk])
+            else:
+                # First chunk - pad with zeros
+                padding = np.zeros(1920, dtype=np.float32)
+                padded_audio = np.concatenate([padding, audio_chunk])
+            
+            logger.debug(f"{self}: Running SDK chunk (total: {len(padded_audio)} samples)")
+            
+            # Run SDK processing in executor (non-blocking)
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._sdk.run_chunk,
+                padded_audio,
+                self._chunk_size
+            )
+            
+            # Update history for next chunk
+            self._audio_history = audio_chunk
+            
     async def _process_audio_chunks(self):
         """Process accumulated audio chunks using Ditto's run_chunk() method."""
         if not self._sdk or self._interrupted:
