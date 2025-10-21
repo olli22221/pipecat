@@ -147,6 +147,7 @@ async def main():
             camera_out_height=512,
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
+            join_timeout=30,  # Increase timeout for Ditto initialization (default: 10s)
         ),
     )
 

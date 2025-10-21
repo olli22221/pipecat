@@ -305,6 +305,7 @@ class DailyParams(TransportParams):
         microphone_out_enabled: Whether to enable the main microphone track.
         transcription_enabled: Whether to enable speech transcription.
         transcription_settings: Configuration for transcription service.
+        join_timeout: Timeout in seconds for joining a Daily room (default: 10).
     """
 
     api_url: str = "https://api.daily.co/v1"
@@ -315,6 +316,7 @@ class DailyParams(TransportParams):
     microphone_out_enabled: bool = True
     transcription_enabled: bool = False
     transcription_settings: DailyTranscriptionSettings = DailyTranscriptionSettings()
+    join_timeout: int = 10
 
 
 class DailyCallbacks(BaseModel):
@@ -828,7 +830,7 @@ class DailyTransportClient(EventHandler):
             },
         )
 
-        return await asyncio.wait_for(future, timeout=10)
+        return await asyncio.wait_for(future, timeout=self._params.join_timeout)
 
     async def leave(self):
         """Leave the Daily room and cleanup resources."""
