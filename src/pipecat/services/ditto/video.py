@@ -196,36 +196,43 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: SDK setup completed, worker threads started")
             logger.info(f"{self}: Original writer type: {type(self._sdk.writer)}")
 
-            # Monkey-patch the VideoWriterByImageIO instance's __call__ method
+            # Wrap the writer object with a custom callable
             # The worker thread calls self.writer(frame, fmt="rgb")
-            # VideoWriterByImageIO is a callable object, so we patch its __call__
             frame_count = [0]  # Use list to allow mutation in nested function
             original_writer = self._sdk.writer
-            original_call = original_writer.__call__
 
-            def patched_call(frame_rgb, fmt="rgb"):
-                """Patched __call__ that captures frames"""
-                try:
-                    # Capture frame for streaming
-                    if isinstance(frame_rgb, np.ndarray):
-                        self._frame_capture_queue.put(frame_rgb)
-                        frame_count[0] += 1
-                        if frame_count[0] % 25 == 0:  # Log every second
-                            logger.info(f"{self}: Custom writer captured {frame_count[0]} frames")
-                    else:
-                        logger.warning(f"{self}: Writer called with non-ndarray: {type(frame_rgb)}")
+            class WriterWrapper:
+                """Wrapper that captures frames before passing to original writer"""
+                def __init__(self, original, capture_queue, service_self):
+                    self.original = original
+                    self.capture_queue = capture_queue
+                    self.service_self = service_self
+                    self.frame_count = 0
 
-                    # Also call original writer to keep progress bar updated
-                    original_call(frame_rgb, fmt=fmt)
-                except Exception as e:
-                    logger.error(f"{self}: Error in patched writer: {e}")
-                    import traceback
-                    traceback.print_exc()
+                def __call__(self, frame_rgb, fmt="rgb"):
+                    try:
+                        # Capture frame for streaming
+                        if isinstance(frame_rgb, np.ndarray):
+                            self.capture_queue.put(frame_rgb)
+                            self.frame_count += 1
+                            if self.frame_count % 25 == 0:  # Log every second
+                                logger.info(f"{self.service_self}: Custom writer captured {self.frame_count} frames")
 
-            # Replace the __call__ method on the instance
-            original_writer.__call__ = patched_call
-            logger.info(f"{self}: Monkey-patched VideoWriterByImageIO.__call__ to capture frames")
-            logger.debug(f"{self}: Writer instance: {original_writer}")
+                        # Call original writer
+                        return self.original(frame_rgb, fmt=fmt)
+                    except Exception as e:
+                        logger.error(f"{self.service_self}: Error in writer wrapper: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                def __getattr__(self, name):
+                    # Delegate attribute access to original writer
+                    return getattr(self.original, name)
+
+            # Replace the writer with our wrapper
+            self._sdk.writer = WriterWrapper(original_writer, self._frame_capture_queue, self)
+            logger.info(f"{self}: Wrapped VideoWriterByImageIO with frame capturer")
+            logger.debug(f"{self}: Original writer type: {type(original_writer)}")
 
             # Start background task to read frames from SDK's writer_queue
             self._frame_reader_running = True
