@@ -495,12 +495,19 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.error(f"{self}: Worker thread exception: {self._sdk.worker_exception}")
             raise self._sdk.worker_exception
 
-        # Log queue sizes immediately after processing
+        # Log ALL queue sizes to find where frames are stuck
         import time
         time.sleep(0.5)  # Give worker threads a moment to process
-        if hasattr(self._sdk, 'writer_queue'):
-            logger.info(f"{self}: writer_queue size after run_chunk: {self._sdk.writer_queue.qsize()}")
-        logger.info(f"{self}: frame_capture_queue size after run_chunk: {self._frame_capture_queue.qsize()}")
+
+        queue_names = ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
+                      'decode_f3d_queue', 'putback_queue', 'writer_queue']
+        queue_sizes = {}
+        for qname in queue_names:
+            if hasattr(self._sdk, qname):
+                queue_sizes[qname] = getattr(self._sdk, qname).qsize()
+
+        logger.info(f"{self}: SDK pipeline queues: {queue_sizes}")
+        logger.info(f"{self}: frame_capture_queue size: {self._frame_capture_queue.qsize()}")
 
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes"""
