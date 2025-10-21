@@ -132,11 +132,11 @@ class DittoTalkingHeadService(FrameProcessor):
 
             # Initialize SDK with online_mode=True
             logger.info(f"{self}: Initializing Ditto StreamSDK in online mode...")
-            self._sdk = StreamSDK(
-                self._cfg_pkl, 
-                self._data_root, 
-                online_mode=True,
-                overlap_v2=65  # ← ADD THIS! (was 10, now 65)
+            self._sdk = StreamSDK(self._cfg_pkl, self._data_root, online_mode=True)
+            self._sdk.setup(
+                source_path=self._source_image_path,
+                output_path=temp_output,
+                overlap_v2=65  # ← ADD HERE!
             )
 
             # Force online_mode
