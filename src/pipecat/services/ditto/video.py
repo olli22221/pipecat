@@ -445,38 +445,37 @@ class DittoTalkingHeadService(FrameProcessor):
         logger.debug(f"{self}: Calling SDK.run_chunk with {len(audio_chunk)} samples")
         logger.info(f"{self}: Audio shape: {audio_chunk.shape}, chunk_size: {self._chunk_size}")
 
-        # CHECK WORKER THREADS STATUS BEFORE PROCESSING
+        # CHECK WORKER THREAD STATUS BEFORE PROCESSING
         logger.info(f"{self}: ===== WORKER THREAD STATUS =====")
-        if hasattr(self._sdk, 'workers'):
-            for i, worker in enumerate(self._sdk.workers):
-                if hasattr(worker, 'is_alive'):
-                    is_alive = worker.is_alive()
-                    logger.info(f"{self}: Worker {i} ({worker.name if hasattr(worker, 'name') else 'unnamed'}): alive={is_alive}")
-                    if not is_alive:
-                        logger.error(f"{self}: ⚠️ Worker {i} is DEAD!")
-                else:
-                    logger.info(f"{self}: Worker {i}: {type(worker)}")
+        if hasattr(self._sdk, 'thread_list'):
+            logger.info(f"{self}: Found {len(self._sdk.thread_list)} threads in thread_list")
+            for i, thread in enumerate(self._sdk.thread_list):
+                if hasattr(thread, 'is_alive'):
+                    is_alive = thread.is_alive()
+                    thread_name = thread.name if hasattr(thread, 'name') else f"Thread-{i}"
+                    if is_alive:
+                        logger.info(f"{self}: ✅ Thread {i} ({thread_name}): ALIVE")
+                    else:
+                        logger.error(f"{self}: ⚠️ Thread {i} ({thread_name}): DEAD!")
+            
+            # Check if stop_event is set
+            if hasattr(self._sdk, 'stop_event'):
+                logger.info(f"{self}: SDK stop_event.is_set(): {self._sdk.stop_event.is_set()}")
         else:
-            logger.warning(f"{self}: SDK has no 'workers' attribute!")
-        
-        # Check if SDK has a process/daemon/thread manager
-        if hasattr(self._sdk, 'pipeline'):
-            logger.info(f"{self}: SDK has pipeline attribute")
-        if hasattr(self._sdk, 'started'):
-            logger.info(f"{self}: SDK started: {self._sdk.started}")
-        if hasattr(self._sdk, 'running'):
-            logger.info(f"{self}: SDK running: {self._sdk.running}")
+            logger.warning(f"{self}: SDK has no 'thread_list' attribute!")
         
         logger.info(f"{self}: ===== END WORKER THREAD STATUS =====")
 
-        # Log what's about to be processed
-        logger.info(f"{self}: Calling run_chunk with:")
-        logger.info(f"{self}:   - audio_chunk.shape: {audio_chunk.shape}")
-        logger.info(f"{self}:   - audio_chunk.dtype: {audio_chunk.dtype}")
-        logger.info(f"{self}:   - audio_chunk min/max: {audio_chunk.min():.4f} / {audio_chunk.max():.4f}")
-        logger.info(f"{self}:   - chunk_size: {self._chunk_size}")
-        logger.info(f"{self}:   - SDK online_mode: {getattr(self._sdk, 'online_mode', 'N/A')}")
+        # Check queue sizes BEFORE run_chunk
+        logger.info(f"{self}: Queue sizes BEFORE run_chunk:")
+        for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
+                    'decode_f3d_queue', 'putback_queue', 'writer_queue']:
+            if hasattr(self._sdk, qname):
+                q = getattr(self._sdk, qname)
+                logger.info(f"{self}:   {qname}: {q.qsize()}")
 
+        logger.info(f"{self}: Calling run_chunk...")
+        
         # Call run_chunk
         try:
             self._sdk.run_chunk(audio_chunk, self._chunk_size)
@@ -487,42 +486,40 @@ class DittoTalkingHeadService(FrameProcessor):
             traceback.print_exc()
             raise
 
+        # Check queue sizes IMMEDIATELY after run_chunk (before sleep)
+        logger.info(f"{self}: Queue sizes IMMEDIATELY after run_chunk:")
+        for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
+                    'decode_f3d_queue', 'putback_queue', 'writer_queue']:
+            if hasattr(self._sdk, qname):
+                q = getattr(self._sdk, qname)
+                size = q.qsize()
+                if size > 0:
+                    logger.warning(f"{self}:   ⚠️ {qname}: {size} (HAS DATA!)")
+                else:
+                    logger.info(f"{self}:   {qname}: {size}")
+
         # Check for worker exceptions
         if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
             logger.error(f"{self}: ⚠️ Worker thread exception detected: {self._sdk.worker_exception}")
             raise self._sdk.worker_exception
 
-        # Wait longer for processing
+        # Wait for processing
         import time
-        logger.info(f"{self}: Waiting 2 seconds for worker threads to process...")
-        time.sleep(2.0)
+        logger.info(f"{self}: Waiting 0.5 seconds for worker threads to process...")
+        time.sleep(0.5)
 
-        # Check ALL queues in detail
-        logger.info(f"{self}: ===== QUEUE STATUS AFTER run_chunk =====")
-        for attr_name in dir(self._sdk):
-            try:
-                attr = getattr(self._sdk, attr_name)
-                if hasattr(attr, 'qsize'):
-                    qsize = attr.qsize()
-                    if qsize > 0:
-                        logger.warning(f"{self}: ⚠️ {attr_name} HAS DATA! qsize={qsize}")
-                        # Try to peek at what's in the queue
-                        if hasattr(attr, 'queue'):
-                            logger.info(f"{self}:   Queue contents preview: {list(attr.queue)[:3]}")
-                    else:
-                        logger.info(f"{self}: {attr_name}: qsize=0 (empty)")
-            except Exception as e:
-                pass
+        # Check queues after short wait
+        logger.info(f"{self}: ===== QUEUE STATUS AFTER 0.5s =====")
+        for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
+                    'decode_f3d_queue', 'putback_queue', 'writer_queue']:
+            if hasattr(self._sdk, qname):
+                q = getattr(self._sdk, qname)
+                size = q.qsize()
+                if size > 0:
+                    logger.warning(f"{self}: ⚠️ {qname}: qsize={size} (HAS DATA!)")
+                else:
+                    logger.info(f"{self}: {qname}: qsize=0 (empty)")
         logger.info(f"{self}: ===== END QUEUE STATUS =====")
-
-        # Check if run_chunk actually did anything
-        if hasattr(self._sdk, 'n_generated_frames'):
-            logger.info(f"{self}: n_generated_frames: {self._sdk.n_generated_frames}")
-        
-        # Check internal counters
-        for attr_name in ['n_chunks_processed', 'frame_count', 'total_frames']:
-            if hasattr(self._sdk, attr_name):
-                logger.info(f"{self}: {attr_name}: {getattr(self._sdk, attr_name)}")
 
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes."""
