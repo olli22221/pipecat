@@ -133,11 +133,6 @@ class DittoTalkingHeadService(FrameProcessor):
             # Initialize SDK with online_mode=True
             logger.info(f"{self}: Initializing Ditto StreamSDK in online mode...")
             self._sdk = StreamSDK(self._cfg_pkl, self._data_root, online_mode=True)
-            self._sdk.setup(
-                source_path=self._source_image_path,
-                output_path=temp_output,
-                overlap_v2=65  # ← ADD HERE!
-            )
 
             # Force online_mode
             self._sdk.online_mode = True
@@ -150,11 +145,12 @@ class DittoTalkingHeadService(FrameProcessor):
             import tempfile
             temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
 
-            # Call setup FIRST (this creates writer and starts threads)
+            # Call setup with overlap_v2
             logger.info(f"{self}: Calling SDK.setup()...")
             self._sdk.setup(
                 source_path=self._source_image_path,
                 output_path=temp_output,
+                overlap_v2=65  # Reduce accumulation requirement for short utterances
             )
             logger.info(f"{self}: SDK.setup() completed")
 
