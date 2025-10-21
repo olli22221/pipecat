@@ -150,7 +150,7 @@ class DittoTalkingHeadService(FrameProcessor):
             self._sdk.setup(
                 source_path=self._source_image_path,
                 output_path=temp_output,
-                overlap_v2=80  # Reduce accumulation requirement for short utterances
+                overlap_v2=79  # Reduce accumulation requirement for short utterances
             )
             logger.info(f"{self}: SDK.setup() completed")
 
