@@ -181,21 +181,8 @@ class DittoTalkingHeadService(FrameProcessor):
             else:
                 logger.info(f"{self}: SDK initialized (online_mode attribute not available)")
 
-            # Setup SDK with source image and temporary output path
-            import tempfile
-            temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
-
-            # CRITICAL: This is where the source image is loaded and processed
-            # The SDK will use this image for all video generation in this session
-            logger.info(f"{self}: Loading avatar image and setting up SDK...")
-            self._sdk.setup(
-                source_path=self._source_image_path,  # Avatar face image loaded here
-                output_path=temp_output,
-            )
-
-            # Replace SDK's writer with our custom frame capturer
-            # The SDK's writer is called for each generated frame
-            # Instead of writing to file, we'll queue frames for streaming
+            # Replace SDK's writer BEFORE calling setup()
+            # setup() starts the worker threads, so we must replace the writer first
             frame_count = [0]  # Use list to allow mutation in nested function
 
             def custom_writer(frame_rgb, fmt="rgb"):
@@ -215,8 +202,22 @@ class DittoTalkingHeadService(FrameProcessor):
                     traceback.print_exc()
 
             self._sdk.writer = custom_writer
-            logger.info(f"{self}: Replaced SDK writer with custom frame capturer")
+            logger.info(f"{self}: Replaced SDK writer with custom frame capturer (BEFORE setup)")
             logger.debug(f"{self}: SDK writer type: {type(self._sdk.writer)}")
+
+            # Setup SDK with source image and temporary output path
+            import tempfile
+            temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
+
+            # CRITICAL: This is where the source image is loaded and processed
+            # The SDK will use this image for all video generation in this session
+            # This also starts the worker threads which will call our custom writer
+            logger.info(f"{self}: Loading avatar image and setting up SDK...")
+            self._sdk.setup(
+                source_path=self._source_image_path,  # Avatar face image loaded here
+                output_path=temp_output,
+            )
+            logger.info(f"{self}: SDK setup completed, worker threads started")
 
             # Start background task to read frames from SDK's writer_queue
             self._frame_reader_running = True
@@ -487,6 +488,11 @@ class DittoTalkingHeadService(FrameProcessor):
         self._sdk.run_chunk(audio_chunk, self._chunk_size)
         logger.debug(f"{self}: SDK.run_chunk completed")
 
+        # Check if any worker thread encountered an exception
+        if hasattr(self._sdk, 'worker_exception') and self._sdk.worker_exception is not None:
+            logger.error(f"{self}: Worker thread exception: {self._sdk.worker_exception}")
+            raise self._sdk.worker_exception
+
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes"""
         # Process all remaining chunks (with overlap)
@@ -503,6 +509,18 @@ class DittoTalkingHeadService(FrameProcessor):
                 await self._process_audio_chunks()
 
         logger.info(f"{self}: Audio processing finalized")
+
+        # Wait for frames to propagate through the worker thread pipeline
+        # The SDK processes frames asynchronously, so we need to give them time
+        logger.debug(f"{self}: Waiting for frames to propagate through pipeline...")
+        await asyncio.sleep(2.0)  # Give worker threads time to process
+
+        # Debug: Check queue sizes to see where frames might be stuck
+        if hasattr(self._sdk, 'audio2motion_queue'):
+            logger.debug(f"{self}: audio2motion_queue size: {self._sdk.audio2motion_queue.qsize()}")
+        if hasattr(self._sdk, 'writer_queue'):
+            logger.debug(f"{self}: writer_queue size: {self._sdk.writer_queue.qsize()}")
+        logger.debug(f"{self}: frame_capture_queue size: {self._frame_capture_queue.qsize()}")
 
     async def _read_frames_from_sdk(self):
         """
