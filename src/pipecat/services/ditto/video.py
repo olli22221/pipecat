@@ -136,8 +136,8 @@ class DittoTalkingHeadService(FrameProcessor):
                 self._cfg_pkl, 
                 self._data_root, 
                 online_mode=True,
-                overlap_v2=5  # REDUCE FROM 10 TO 5 - this makes valid_clip_len = 75 instead of 70
-                )
+                overlap_v2=65  # ← ADD THIS! (was 10, now 65)
+            )
 
             # Force online_mode
             self._sdk.online_mode = True
