@@ -145,7 +145,7 @@ class DittoTalkingHeadService(FrameProcessor):
             import tempfile
             temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
 
-            # Call setup with overlap_v2
+            # Call setup with overlap_v2 to reduce accumulation requirement
             logger.info(f"{self}: Calling SDK.setup()...")
             self._sdk.setup(
                 source_path=self._source_image_path,
@@ -154,42 +154,47 @@ class DittoTalkingHeadService(FrameProcessor):
             )
             logger.info(f"{self}: SDK.setup() completed")
 
-            # NOW patch the writer instance's __call__ method directly
-            logger.info(f"{self}: Patching writer instance...")
-            
-            original_writer = self._sdk.writer
-            original_call = original_writer.__call__
-            
+            # Create a wrapper class that intercepts calls to the writer
+            logger.info(f"{self}: Wrapping writer to capture frames...")
+
             frame_capture_queue = queue_module.Queue()
             frame_save_dir = self._save_frames_dir
             frame_count = [0]
-            
-            def patched_call(frame_rgb, fmt="rgb"):
-                """Intercept frame writes."""
-                if isinstance(frame_rgb, np.ndarray):
-                    frame_capture_queue.put(frame_rgb.copy())
-                    frame_count[0] += 1
+            original_writer = self._sdk.writer
+
+            class WriterWrapper:
+                """Wrapper that intercepts all calls to the writer."""
+                def __init__(self, original):
+                    self.original = original
                     
-                    if frame_save_dir:
-                        frame_path = os.path.join(frame_save_dir, f"frame_{frame_count[0]:06d}.png")
-                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                        cv2.imwrite(frame_path, frame_bgr)
+                def __call__(self, frame_rgb, fmt="rgb"):
+                    """Intercept and capture frames."""
+                    if isinstance(frame_rgb, np.ndarray):
+                        frame_capture_queue.put(frame_rgb.copy())
+                        frame_count[0] += 1
+                        
+                        if frame_save_dir:
+                            frame_path = os.path.join(frame_save_dir, f"frame_{frame_count[0]:06d}.png")
+                            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                            cv2.imwrite(frame_path, frame_bgr)
+                        
+                        if frame_count[0] == 1:
+                            logger.info(f"🎉 FIRST FRAME CAPTURED!")
+                        elif frame_count[0] % 10 == 0:
+                            logger.info(f"Captured {frame_count[0]} frames")
                     
-                    if frame_count[0] == 1:
-                        logger.info(f"🎉 FIRST FRAME CAPTURED!")
-                    elif frame_count[0] % 25 == 0:
-                        logger.info(f"DittoTalkingHeadService#0: Captured {frame_count[0]} frames")
-                    elif frame_count[0] <= 5:
-                        logger.info(f"DittoTalkingHeadService#0: Captured frame #{frame_count[0]}")
+                    # Call original writer
+                    return self.original(frame_rgb, fmt)
                 
-                return original_call(frame_rgb, fmt)
-            
-            # Replace the instance method
-            import types
-            self._sdk.writer.__call__ = types.MethodType(patched_call, self._sdk.writer)
-            
-            logger.info(f"{self}: Writer instance patched successfully")
-            
+                def close(self):
+                    """Forward close to original."""
+                    if hasattr(self.original, 'close'):
+                        return self.original.close()
+
+            # Replace the writer object entirely
+            self._sdk.writer = WriterWrapper(original_writer)
+            logger.info(f"{self}: Writer wrapped successfully")
+
             # Store the frame capture queue
             self._frame_capture_queue = frame_capture_queue
 
