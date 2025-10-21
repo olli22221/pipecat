@@ -593,7 +593,7 @@ class DittoTalkingHeadService(FrameProcessor):
                 break
 
     async def _read_frames_from_sdk(self):
-            """
+        """
         Background task that reads generated frames from our custom frame capture queue.
         The SDK's writer calls our custom CapturingVideoWriter which puts frames into this queue.
         """
