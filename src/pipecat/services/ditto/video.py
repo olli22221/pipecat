@@ -117,11 +117,6 @@ class DittoTalkingHeadService(FrameProcessor):
         # SDK access lock to prevent concurrent run_chunk calls
         self._sdk_lock = asyncio.Lock()
 
-        # Audio-Video synchronization
-        self._audio_frame_buffer = []  # Buffer TTSAudioRawFrame for sync
-        self._video_frames_per_audio_chunk = 8  # Ditto generates ~8 frames per 405ms audio chunk
-        self._audio_chunk_counter = 0  # Track audio chunks processed
-
         # Create save directory if specified
         if self._save_frames_dir:
             os.makedirs(self._save_frames_dir, exist_ok=True)
@@ -375,12 +370,6 @@ class DittoTalkingHeadService(FrameProcessor):
             self._is_speaking = True  # Set speaking flag immediately when TTS starts
             self._audio_buffer.clear()
 
-            # Clear audio frame buffer from previous utterance
-            audio_buffer_size = len(self._audio_frame_buffer)
-            self._audio_frame_buffer.clear()
-            if audio_buffer_size > 0:
-                logger.info(f"{self}: Cleared {audio_buffer_size} buffered audio frames")
-
             # Clear any queued idle frames to prevent them from playing during speech
             cleared_count = 0
             while not self._video_frame_queue.empty():
@@ -398,11 +387,6 @@ class DittoTalkingHeadService(FrameProcessor):
             if not self._initialized or self._is_interrupting:
                 pass
             else:
-                # Buffer audio frame for sync with video
-                # Don't push it through yet - we'll release it when video is ready
-                self._audio_frame_buffer.append(frame)
-                logger.debug(f"{self}: Buffered audio frame (buffer size: {len(self._audio_frame_buffer)})")
-
                 # Queue audio for processing by Ditto
                 await self._audio_queue.put(frame)
 
@@ -419,18 +403,14 @@ class DittoTalkingHeadService(FrameProcessor):
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self.stop(frame)
 
-        # Don't push TTSAudioRawFrame immediately - it's buffered and will be released in sync with video
-        if not isinstance(frame, TTSAudioRawFrame):
-            await self.push_frame(frame, direction)
+        # Push all frames downstream
+        await self.push_frame(frame, direction)
 
     async def _handle_interruption(self):
         """Handle user interruption by stopping audio processing and restarting."""
         self._is_interrupting = True
         self._audio_buffer.clear()
         self._event_id = None
-
-        # Clear audio frame buffer
-        self._audio_frame_buffer.clear()
 
         # Cancel and restart audio task
         await self._cancel_audio_task()
@@ -471,6 +451,10 @@ class DittoTalkingHeadService(FrameProcessor):
                 if chunk_count % 100 == 0:
                     logger.debug(f"{self}: Idle generator loop - _is_speaking={self._is_speaking}, chunk_count={chunk_count}")
 
+                # Log state for debugging (every iteration during critical transitions)
+                if chunk_count < 10 or chunk_count % 10 == 0:
+                    logger.info(f"{self}: Idle loop check - _is_speaking={self._is_speaking}, will_generate={not self._is_speaking and self._sdk is not None and self._initialized}")
+
                 # Only generate idle frames when not speaking
                 # This prevents interference with speech-driven frame generation
                 if not self._is_speaking and self._sdk is not None and self._initialized:
@@ -504,14 +488,16 @@ class DittoTalkingHeadService(FrameProcessor):
                     try:
                         # Run silent chunk through Ditto to generate neutral frames
                         # Use lock to prevent interference with speech audio processing
+                        logger.info(f"{self}: IDLE generator about to acquire SDK lock (chunk {chunk_count})")
                         async with self._sdk_lock:
-                            logger.debug(f"{self}: IDLE generator acquired SDK lock, feeding silent audio")
+                            logger.info(f"{self}: ⚠️  IDLE generator acquired SDK lock, feeding SILENT audio (chunk {chunk_count})")
                             await asyncio.get_event_loop().run_in_executor(
                                 None,
                                 self._sdk.run_chunk,
                                 padded_audio,
                                 self._chunk_size
                             )
+                            logger.info(f"{self}: IDLE generator released SDK lock (chunk {chunk_count})")
 
                         # Update history for next chunk
                         self._audio_history = silent_audio
@@ -685,20 +671,10 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily.
-
-        Also releases buffered audio frames in sync with video to maintain A/V sync.
-        """
+        """Consume video frames from queue and push to Daily."""
         logger.info(f"{self}: Video playback task started")
 
         frames_pushed = 0
-        audio_frames_released = 0
-        frames_since_audio_release = 0
-
-        # Release one audio frame for every N video frames to maintain sync
-        # Ditto generates ~8 video frames per 405ms audio chunk at 20fps
-        # TTS audio frames are smaller chunks, so we release more frequently
-        AUDIO_RELEASE_INTERVAL = 2  # Release audio every 2 video frames
 
         try:
             while True:
@@ -714,12 +690,11 @@ class DittoTalkingHeadService(FrameProcessor):
                         break
 
                     frames_pushed += 1
-                    frames_since_audio_release += 1
 
                     if frames_pushed == 1:
                         logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
                     elif frames_pushed % 10 == 0:
-                        logger.info(f"{self}: Pushed {frames_pushed} video frames, released {audio_frames_released} audio frames (buffer: {len(self._audio_frame_buffer)})")
+                        logger.info(f"{self}: Pushed {frames_pushed} video frames to Daily")
 
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
@@ -731,15 +706,6 @@ class DittoTalkingHeadService(FrameProcessor):
                     # Push video frame to pipeline
                     await self.push_frame(output_frame)
                     logger.debug(f"{self}: Pushed video frame {frames_pushed}")
-
-                    # Release buffered audio frames in sync with video
-                    if frames_since_audio_release >= AUDIO_RELEASE_INTERVAL and self._audio_frame_buffer:
-                        # Release one audio frame
-                        audio_frame = self._audio_frame_buffer.pop(0)
-                        await self.push_frame(audio_frame, FrameDirection.DOWNSTREAM)
-                        audio_frames_released += 1
-                        frames_since_audio_release = 0
-                        logger.debug(f"{self}: Released audio frame (buffer: {len(self._audio_frame_buffer)} remaining)")
                     
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
