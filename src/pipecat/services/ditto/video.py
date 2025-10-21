@@ -175,11 +175,9 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Initializing Ditto StreamSDK...")
             self._sdk = StreamSDK(self._cfg_pkl, self._data_root, online_mode=True)
 
-            # Log online_mode if available
+            # Log initial online_mode
             if hasattr(self._sdk, 'online_mode'):
-                logger.info(f"{self}: SDK online_mode: {self._sdk.online_mode}")
-            else:
-                logger.info(f"{self}: SDK initialized (online_mode attribute not available)")
+                logger.info(f"{self}: SDK online_mode after init: {self._sdk.online_mode}")
 
             # Setup SDK with source image and temporary output path
             import tempfile
@@ -194,6 +192,18 @@ class DittoTalkingHeadService(FrameProcessor):
                 output_path=temp_output,
             )
             logger.info(f"{self}: SDK setup completed, worker threads started")
+
+            # CRITICAL: Force online_mode=True AFTER setup (config file overrides it during setup)
+            # The SDK object must be in online mode for real-time chunk processing
+            self._sdk.online_mode = True
+
+            # Also force online_mode on audio2motion component if it exists
+            if hasattr(self._sdk, 'audio2motion') and hasattr(self._sdk.audio2motion, 'online_mode'):
+                self._sdk.audio2motion.online_mode = True
+                logger.info(f"{self}: Forced audio2motion.online_mode to True")
+
+            logger.info(f"{self}: Forced SDK online_mode to True for real-time streaming")
+            logger.info(f"{self}: Final SDK online_mode: {self._sdk.online_mode}")
             logger.info(f"{self}: Original writer type: {type(self._sdk.writer)}")
 
             # IMPORTANT: The SDK's worker threads call writer(frame, fmt="rgb")
