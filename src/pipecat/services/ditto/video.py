@@ -146,6 +146,58 @@ class DittoTalkingHeadService(FrameProcessor):
 
             logger.info(f"{self}: Final SDK online_mode: {self._sdk.online_mode}")
 
+            # ==================== GPU DIAGNOSTICS ====================
+            import torch
+            logger.info(f"{self}: ===== GPU DIAGNOSTICS =====")
+            logger.info(f"{self}: PyTorch CUDA available: {torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                logger.info(f"{self}: GPU: {torch.cuda.get_device_name(0)}")
+                logger.info(f"{self}: Initial VRAM: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB")
+            
+            # Check Ditto model device
+            if hasattr(self._sdk, 'audio2motion'):
+                a2m = self._sdk.audio2motion
+                
+                # Find the actual model
+                if hasattr(a2m, 'audio2motion_model'):
+                    model = a2m.audio2motion_model
+                    device = next(model.parameters()).device
+                    logger.info(f"{self}: ⚠️ Audio2Motion model is on: {device}")
+                    
+                    # Force to GPU if not already
+                    if device.type == 'cpu':
+                        logger.warning(f"{self}: Model is on CPU! Moving to GPU...")
+                        a2m.audio2motion_model = a2m.audio2motion_model.cuda()
+                        logger.info(f"{self}: ✅ Model moved to GPU")
+                        
+                        # Verify
+                        device = next(a2m.audio2motion_model.parameters()).device
+                        logger.info(f"{self}: Verified device: {device}")
+                
+                # Check other models if they exist
+                if hasattr(a2m, 'hubert_model'):
+                    device = next(a2m.hubert_model.parameters()).device
+                    logger.info(f"{self}: Hubert model on: {device}")
+                    if device.type == 'cpu':
+                        a2m.hubert_model = a2m.hubert_model.cuda()
+                        logger.info(f"{self}: Moved Hubert to GPU")
+            
+            # Check other pipeline components
+            for attr_name in ['motion_stitch', 'f3d_warper', 'f3d_decoder']:
+                if hasattr(self._sdk, attr_name):
+                    component = getattr(self._sdk, attr_name)
+                    if hasattr(component, 'model'):
+                        device = next(component.model.parameters()).device
+                        logger.info(f"{self}: {attr_name} model on: {device}")
+                        if device.type == 'cpu':
+                            component.model = component.model.cuda()
+                            logger.info(f"{self}: Moved {attr_name} to GPU")
+            
+            if torch.cuda.is_available():
+                logger.info(f"{self}: After loading VRAM: {torch.cuda.memory_allocated(0) / 1e9:.2f}GB")
+            logger.info(f"{self}: ===== END GPU DIAGNOSTICS =====")
+            # ==================== END GPU DIAGNOSTICS ====================
+
             # Setup SDK paths
             import tempfile
             temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
