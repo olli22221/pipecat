@@ -602,72 +602,51 @@ class DittoTalkingHeadService(FrameProcessor):
                 break
 
     async def _read_frames_from_sdk(self):
-        """
-        Background task that reads generated frames from our custom frame capture queue.
-        The SDK's writer calls our custom CapturingVideoWriter which puts frames into this queue.
-        """
+        """Read frames from SDK's capture queue and add to video playback queue."""
         logger.info(f"{self}: Frame reader task started - reading from capture queue")
-
-        frame_counter = 0
-        fps = 25
-
+        
+        frames_read = 0
         try:
             while self._frame_reader_running:
                 try:
-                    # Read from our frame capture queue
-                    loop = asyncio.get_event_loop()
-                    frame_rgb = await loop.run_in_executor(
+                    # Read from capture queue (populated by our wrapper)
+                    frame = await asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: self._frame_capture_queue.get(timeout=0.1)
                     )
-
-                    if frame_counter == 0:
+                    
+                    if frame is None:
+                        logger.info(f"{self}: Received None from capture queue, stopping reader")
+                        break
+                    
+                    frames_read += 1
+                    
+                    if frames_read == 1:
                         logger.info(f"{self}: 🎉 FIRST FRAME CAPTURED!")
-
-                    if isinstance(frame_rgb, np.ndarray):
-                        height, width = frame_rgb.shape[:2]
-                        target_width, target_height = 512, 512
-
-                        if width != target_width or height != target_height:
-                            frame_rgb = cv2.resize(
-                                frame_rgb,
-                                (target_width, target_height),
-                                interpolation=cv2.INTER_LINEAR
-                            )
-                            width, height = target_width, target_height
-
-                        frame_bytes = frame_rgb.tobytes()
-
-                        output_frame = OutputImageRawFrame(
-                            image=frame_bytes,
-                            size=(width, height),
-                            format="RGB"
-                        )
-
-                        output_frame.pts = frame_counter
-                        frame_counter += 1
-
-                        await self._video_queue.put((output_frame, 1.0 / fps))
-
-                        if frame_counter % 25 == 0:
-                            logger.info(f"{self}: Processed {frame_counter} video frames")
-
+                    elif frames_read % 10 == 0:
+                        logger.info(f"{self}: Read {frames_read} frames from SDK")
+                    
+                    # Add to video playback queue
+                    await self._video_frame_queue.put(frame)
+                    logger.debug(f"{self}: Added frame to video queue (qsize={self._video_frame_queue.qsize()})")
+                    
                 except queue_module.Empty:
                     await asyncio.sleep(0.01)
+                    continue
                 except Exception as e:
-                    if self._frame_reader_running:
-                        logger.error(f"{self}: Error reading frame: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    await asyncio.sleep(0.1)
-
+                    logger.error(f"{self}: Error reading frame: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    break
+        
         except asyncio.CancelledError:
-            logger.info(f"{self}: Frame reader task cancelled (read {frame_counter} frames)")
-            raise
+            logger.info(f"{self}: Frame reader task cancelled (read {frames_read} frames)")
         except Exception as e:
-            logger.error(f"{self}: Error in frame reader: {e}")
+            logger.error(f"{self}: Frame reader error: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
         """Push video frames downstream at the correct frame rate."""
