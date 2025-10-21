@@ -721,6 +721,7 @@ class DailyTransportClient(EventHandler):
                 height=self._params.video_out_height,
                 color_format=self._params.video_out_color_format,
             )
+            Daily.select_camera_device(self._camera_name())
 
         if self._params.audio_out_enabled and not self._microphone_track:
             audio_source = CustomAudioSource(self._out_sample_rate, self._params.audio_out_channels)
