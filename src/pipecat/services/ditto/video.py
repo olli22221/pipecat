@@ -181,6 +181,13 @@ class DittoTalkingHeadService(FrameProcessor):
             else:
                 logger.info(f"{self}: SDK initialized (online_mode attribute not available)")
 
+            # Debug: check for writer_queue
+            logger.debug(f"{self}: SDK attributes: {dir(self._sdk)}")
+            if hasattr(self._sdk, 'writer_queue'):
+                logger.info(f"{self}: SDK has writer_queue available")
+            else:
+                logger.warning(f"{self}: SDK does NOT have writer_queue attribute")
+
             # Setup SDK with source image and temporary output path
             import tempfile
             temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
@@ -488,6 +495,8 @@ class DittoTalkingHeadService(FrameProcessor):
             while self._frame_reader_running:
                 # Check if SDK is ready
                 if not self._sdk or not hasattr(self._sdk, 'writer_queue'):
+                    if self._sdk and not hasattr(self._sdk, 'writer_queue'):
+                        logger.warning(f"{self}: SDK exists but has no writer_queue attribute")
                     await asyncio.sleep(0.1)
                     continue
 
@@ -518,6 +527,7 @@ class DittoTalkingHeadService(FrameProcessor):
                         # Queue for playback at correct frame rate (25fps)
                         fps = 25
                         await self._video_queue.put((output_frame, 1.0 / fps))
+                        logger.debug(f"{self}: Queued video frame {width}x{height}")
 
                 except queue_module.Empty:
                     # No frame available yet
@@ -543,12 +553,17 @@ class DittoTalkingHeadService(FrameProcessor):
         logger.info(f"{self}: Video playback task started")
 
         try:
+            frame_count = 0
             while True:
                 # Get next frame from queue (blocks until available)
                 frame, frame_duration = await self._video_queue.get()
 
                 # Push frame downstream
                 await self.push_frame(frame)
+                frame_count += 1
+
+                if frame_count % 25 == 0:  # Log every second (25fps)
+                    logger.debug(f"{self}: Pushed {frame_count} video frames downstream")
 
                 # Wait for correct frame rate
                 await asyncio.sleep(frame_duration)
