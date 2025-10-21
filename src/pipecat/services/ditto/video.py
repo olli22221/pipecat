@@ -527,16 +527,28 @@ class DittoTalkingHeadService(FrameProcessor):
         logger.info(f"{self}: Audio processing finalized")
 
         # Wait for frames to propagate through the worker thread pipeline
-        # The SDK processes frames asynchronously, so we need to give them time
-        logger.debug(f"{self}: Waiting for frames to propagate through pipeline...")
-        await asyncio.sleep(2.0)  # Give worker threads time to process
+        # The SDK processes frames asynchronously through multiple stages
+        logger.info(f"{self}: Waiting for frames to propagate through pipeline...")
+        for i in range(6):  # Check every second for 6 seconds
+            await asyncio.sleep(1.0)
 
-        # Debug: Check queue sizes to see where frames might be stuck
-        if hasattr(self._sdk, 'audio2motion_queue'):
-            logger.debug(f"{self}: audio2motion_queue size: {self._sdk.audio2motion_queue.qsize()}")
-        if hasattr(self._sdk, 'writer_queue'):
-            logger.debug(f"{self}: writer_queue size: {self._sdk.writer_queue.qsize()}")
-        logger.debug(f"{self}: frame_capture_queue size: {self._frame_capture_queue.qsize()}")
+            # Check if we have any frames yet
+            frames_captured = self._frame_capture_queue.qsize()
+            if frames_captured > 0:
+                logger.info(f"{self}: Frames started arriving! {frames_captured} frames captured so far")
+                break
+
+            # Log queue status
+            if i % 2 == 0:  # Every 2 seconds
+                queue_sizes = {}
+                for qname in ['audio2motion_queue', 'motion_stitch_queue', 'warp_f3d_queue',
+                             'decode_f3d_queue', 'putback_queue', 'writer_queue']:
+                    if hasattr(self._sdk, qname):
+                        queue_sizes[qname] = getattr(self._sdk, qname).qsize()
+                logger.debug(f"{self}: After {i+1}s - Pipeline: {queue_sizes}, Captured: {frames_captured}")
+
+        # Final status
+        logger.info(f"{self}: Final frame_capture_queue size: {self._frame_capture_queue.qsize()}")
 
     async def _read_frames_from_sdk(self):
         """
