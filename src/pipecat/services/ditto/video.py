@@ -82,23 +82,30 @@ class DittoTalkingHeadService(FrameProcessor):
         self._chunk_size = chunk_size
         self._save_frames_dir = save_frames_dir
         
-        # Initialize queues
-        self._video_frame_queue = asyncio.Queue()  # ← ADD THIS LINE!
+        # Initialize ALL queues and state variables
+        self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
+        self._video_queue = asyncio.Queue()        # For video frames with timestamps (used in process_frame)
         
-        # Other initialization
+        # SDK and initialization state
         self._sdk = None
         self._initialized = False
+        
+        # Audio processing state
         self._audio_buffer = np.array([], dtype=np.float32)
         self._audio_history = np.array([], dtype=np.float32)
+        self._audio_processing_task = None  # For tracking async audio processing
+        
+        # Frame reading/playback state
         self._frame_reader_running = False
         self._frame_reader_task = None
         self._video_playback_task = None
-        self._frame_capture_queue = None
+        self._frame_capture_queue = None  # Will be set in start()
         
+        # Create save directory if specified
         if self._save_frames_dir:
             os.makedirs(self._save_frames_dir, exist_ok=True)
             logger.info(f"Frames will be saved to: {self._save_frames_dir}")
-
+            
         # Validate paths
         if not os.path.exists(source_image_path):
             raise ValueError(f"Source image not found: {source_image_path}")
