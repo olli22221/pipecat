@@ -86,6 +86,9 @@ class DittoTalkingHeadService(FrameProcessor):
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
         self._video_queue = asyncio.Queue()        # For video frames with timestamps (used in process_frame)
         
+        # Locks for thread safety
+        self._processing_lock = asyncio.Lock()     # Prevents concurrent audio processing
+        
         # SDK and initialization state
         self._sdk = None
         self._initialized = False
