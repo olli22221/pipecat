@@ -369,6 +369,18 @@ class DittoTalkingHeadService(FrameProcessor):
             self._is_interrupting = False
             self._is_speaking = True  # Set speaking flag immediately when TTS starts
             self._audio_buffer.clear()
+
+            # Clear any queued idle frames to prevent them from playing during speech
+            cleared_count = 0
+            while not self._video_frame_queue.empty():
+                try:
+                    self._video_frame_queue.get_nowait()
+                    cleared_count += 1
+                except asyncio.QueueEmpty:
+                    break
+            if cleared_count > 0:
+                logger.info(f"{self}: Cleared {cleared_count} queued idle frames from video queue")
+
             # Note: event_id will be set when first audio frame arrives
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -419,14 +431,6 @@ class DittoTalkingHeadService(FrameProcessor):
         """
         logger.info(f"{self}: Idle frame generator started (target: {self._target_fps} fps)")
 
-        # Calculate frame interval for target FPS
-        frame_interval = 1.0 / self._target_fps  # seconds between frames
-
-        # Ditto generates ~20 fps natively, so calculate how many chunks needed per target frame
-        # Each chunk is 6480 samples at 16kHz = 405ms of audio = ~8 frames at 20fps
-        # To maintain target FPS, we need to feed chunks at the right rate
-        ditto_native_fps = 20  # Ditto's native output FPS
-
         frame_count = 0
         chunk_count = 0
         was_speaking = False  # Track state changes for logging
@@ -435,8 +439,16 @@ class DittoTalkingHeadService(FrameProcessor):
             # Wait a bit for SDK to fully initialize
             await asyncio.sleep(0.5)
 
+            # Calculate frame interval for target FPS
+            frame_interval = 1.0 / self._target_fps  # seconds between frames
+            ditto_native_fps = 20  # Ditto's native output FPS
+
             while True:
                 start_time = asyncio.get_event_loop().time()
+
+                # Log current state every 100 iterations for debugging
+                if chunk_count % 100 == 0:
+                    logger.debug(f"{self}: Idle generator loop - _is_speaking={self._is_speaking}, chunk_count={chunk_count}")
 
                 # Only generate idle frames when not speaking
                 # This prevents interference with speech-driven frame generation
@@ -445,6 +457,17 @@ class DittoTalkingHeadService(FrameProcessor):
                     if was_speaking:
                         logger.info(f"{self}: ===== Transitioning to IDLE mode - starting silent audio generation =====")
                         was_speaking = False
+
+                    # Don't generate more idle frames if queue is getting too full
+                    # This prevents idle frames from building up and playing during speech
+                    queue_size = self._video_frame_queue.qsize()
+                    if queue_size > 30:  # ~1 second at 30fps
+                        logger.debug(f"{self}: Video queue is full ({queue_size} frames), skipping idle generation")
+                        # Sleep to maintain timing
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        sleep_time = max(0, frame_interval * (ditto_native_fps / self._target_fps) - elapsed)
+                        await asyncio.sleep(sleep_time)
+                        continue
 
                     # Generate neutral frame by feeding silent audio to Ditto
                     # This ensures continuous frame generation during silence
