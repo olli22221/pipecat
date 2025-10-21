@@ -647,8 +647,14 @@ class DailyTransportClient(EventHandler):
             True if the video frame was written successfully, False otherwise.
         """
         if not frame.transport_destination and self._camera:
+            logger.debug(f"{self}: Writing video frame to camera (size: {frame.size})")
             self._camera.write_frame(frame.image)
             return True
+        else:
+            if frame.transport_destination:
+                logger.warning(f"{self}: Frame has transport_destination={frame.transport_destination}, skipping")
+            if not self._camera:
+                logger.error(f"{self}: Camera is None! Cannot write video frame")
         return False
 
     async def setup(self, setup: FrameProcessorSetup):
@@ -715,13 +721,16 @@ class DailyTransportClient(EventHandler):
                 f"{self}::video_callback_task",
             )
         if self._params.video_out_enabled and not self._camera:
+            camera_name = self._camera_name()
+            logger.info(f"{self}: Creating camera device '{camera_name}' ({self._params.video_out_width}x{self._params.video_out_height})")
             self._camera = Daily.create_camera_device(
-                self._camera_name(),
+                camera_name,
                 width=self._params.video_out_width,
                 height=self._params.video_out_height,
                 color_format=self._params.video_out_color_format,
             )
-            Daily.select_camera_device(self._camera_name())
+            Daily.select_camera_device(camera_name)
+            logger.info(f"{self}: Camera device created and selected")
 
         if self._params.audio_out_enabled and not self._microphone_track:
             audio_source = CustomAudioSource(self._out_sample_rate, self._params.audio_out_channels)
