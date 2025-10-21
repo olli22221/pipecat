@@ -71,35 +71,30 @@ class DittoTalkingHeadService(FrameProcessor):
         source_image_path: str,
         chunk_size: tuple = (3, 5, 2),
         save_frames_dir: Optional[str] = None,
-        **kwargs,
+        **kwargs
     ):
         super().__init__(**kwargs)
-
+        
         self._ditto_path = ditto_path
         self._data_root = data_root
         self._cfg_pkl = cfg_pkl
         self._source_image_path = source_image_path
         self._chunk_size = chunk_size
         self._save_frames_dir = save_frames_dir
-
-        self._initialized = False
-        self._audio_buffer = []
+        
+        # Initialize queues
+        self._video_frame_queue = asyncio.Queue()  # ← ADD THIS LINE!
+        
+        # Other initialization
         self._sdk = None
-
-        # Background tasks and queues
-        self._video_playback_task: Optional[asyncio.Task] = None
-        self._frame_reader_task: Optional[asyncio.Task] = None
-        self._audio_processing_task: Optional[asyncio.Task] = None
-        self._video_queue = asyncio.Queue()
+        self._initialized = False
+        self._audio_buffer = np.array([], dtype=np.float32)
+        self._audio_history = np.array([], dtype=np.float32)
         self._frame_reader_running = False
-
-        # State tracking
-        self._processing_lock = asyncio.Lock()
-        self._interrupted = False
-        self._current_num_frames = 0
-        self._sdk_initialized_for_utterance = False
-
-        # Frame saving
+        self._frame_reader_task = None
+        self._video_playback_task = None
+        self._frame_capture_queue = None
+        
         if self._save_frames_dir:
             os.makedirs(self._save_frames_dir, exist_ok=True)
             logger.info(f"Frames will be saved to: {self._save_frames_dir}")
