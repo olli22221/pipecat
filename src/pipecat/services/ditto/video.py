@@ -523,12 +523,23 @@ class DittoTalkingHeadService(FrameProcessor):
         while len(self._audio_buffer) >= stride_samples and not self._interrupted:
             await self._process_audio_chunks()
 
+        # Add future padding to flush the pipeline
+        # The SDK needs 'future' frames worth of audio to output the last frames
+        future_samples = self._chunk_size[2] * 640  # e.g., 2 * 640 = 1280 for (3,5,2)
+        if future_samples > 0 and not self._interrupted:
+            logger.info(f"{self}: Adding {future_samples} samples of future padding to flush pipeline")
+            future_padding = np.zeros((future_samples,), dtype=np.float32)
+            self._audio_buffer.extend(future_padding.tolist())
+
+            # Process remaining chunks with the padding
+            while len(self._audio_buffer) >= stride_samples and not self._interrupted:
+                await self._process_audio_chunks()
+
         # Process final partial chunk if any remains
         if len(self._audio_buffer) > 0 and not self._interrupted:
             split_len = int(sum(self._chunk_size) * 0.04 * 16000) + 80
-            if len(self._audio_buffer) < split_len:
-                # Final chunk - will be padded in _process_audio_chunks
-                await self._process_audio_chunks()
+            # Final chunk - will be padded to split_len in _process_audio_chunks
+            await self._process_audio_chunks()
 
         logger.info(f"{self}: Audio processing finalized")
 
