@@ -173,7 +173,7 @@ async def main():
         data_root=ditto_data_root,
         cfg_pkl=ditto_cfg_pkl,
         source_image_path=source_image,  # Your avatar face image
-        chunk_size=(3, 5, 2),  # (history, current, future) frames - affects latency
+        chunk_size=(3, 5, 0),  # (history, current, future) frames - 0 future for real-time
     )
 
     # Create context
