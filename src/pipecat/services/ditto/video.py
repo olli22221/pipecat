@@ -495,6 +495,13 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.error(f"{self}: Worker thread exception: {self._sdk.worker_exception}")
             raise self._sdk.worker_exception
 
+        # Log queue sizes immediately after processing
+        import time
+        time.sleep(0.5)  # Give worker threads a moment to process
+        if hasattr(self._sdk, 'writer_queue'):
+            logger.info(f"{self}: writer_queue size after run_chunk: {self._sdk.writer_queue.qsize()}")
+        logger.info(f"{self}: frame_capture_queue size after run_chunk: {self._frame_capture_queue.qsize()}")
+
     async def _finalize_audio(self):
         """Process any remaining audio when TTS completes"""
         # Process all remaining chunks (with overlap)
