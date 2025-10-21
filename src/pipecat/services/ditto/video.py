@@ -196,30 +196,36 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: SDK setup completed, worker threads started")
             logger.info(f"{self}: Original writer type: {type(self._sdk.writer)}")
 
-            # Replace SDK's writer AFTER setup() completes
-            # setup() creates a VideoWriter object and starts worker threads
-            # We replace it so the worker threads call our custom capturer instead
+            # Monkey-patch the VideoWriterByImageIO instance's __call__ method
+            # The worker thread calls self.writer(frame, fmt="rgb")
+            # VideoWriterByImageIO is a callable object, so we patch its __call__
             frame_count = [0]  # Use list to allow mutation in nested function
+            original_writer = self._sdk.writer
+            original_call = original_writer.__call__
 
-            def custom_writer(frame_rgb, fmt="rgb"):
-                """Custom writer that captures frames instead of writing to file"""
+            def patched_call(frame_rgb, fmt="rgb"):
+                """Patched __call__ that captures frames"""
                 try:
-                    # Put frame in our thread-safe queue for async processing
+                    # Capture frame for streaming
                     if isinstance(frame_rgb, np.ndarray):
                         self._frame_capture_queue.put(frame_rgb)
                         frame_count[0] += 1
                         if frame_count[0] % 25 == 0:  # Log every second
-                            logger.debug(f"{self}: Custom writer captured {frame_count[0]} frames")
+                            logger.info(f"{self}: Custom writer captured {frame_count[0]} frames")
                     else:
                         logger.warning(f"{self}: Writer called with non-ndarray: {type(frame_rgb)}")
+
+                    # Also call original writer to keep progress bar updated
+                    original_call(frame_rgb, fmt=fmt)
                 except Exception as e:
-                    logger.error(f"{self}: Error in custom writer: {e}")
+                    logger.error(f"{self}: Error in patched writer: {e}")
                     import traceback
                     traceback.print_exc()
 
-            self._sdk.writer = custom_writer
-            logger.info(f"{self}: Replaced SDK writer with custom frame capturer (AFTER setup)")
-            logger.debug(f"{self}: New writer type: {type(self._sdk.writer)}")
+            # Replace the __call__ method on the instance
+            original_writer.__call__ = patched_call
+            logger.info(f"{self}: Monkey-patched VideoWriterByImageIO.__call__ to capture frames")
+            logger.debug(f"{self}: Writer instance: {original_writer}")
 
             # Start background task to read frames from SDK's writer_queue
             self._frame_reader_running = True
