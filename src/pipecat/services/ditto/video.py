@@ -129,7 +129,6 @@ class DittoTalkingHeadService(FrameProcessor):
             import sys
             sys.path.insert(0, self._ditto_path)
             from stream_pipeline_online import StreamSDK
-            from core.atomic_components.writer import VideoWriterByImageIO
 
             # Initialize SDK with online_mode=True
             logger.info(f"{self}: Initializing Ditto StreamSDK in online mode...")
@@ -146,64 +145,7 @@ class DittoTalkingHeadService(FrameProcessor):
             import tempfile
             temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
 
-            # CRITICAL: Create a custom writer class that captures frames
-            frame_capture_queue = queue_module.Queue()
-            frame_save_dir = self._save_frames_dir
-            frame_count = [0]
-            
-            logger.info(f"{self}: Creating CapturingVideoWriter class...")
-            
-            class CapturingVideoWriter(VideoWriterByImageIO):
-                """Custom writer that captures frames before writing to file."""
-                
-                def __init__(self, *args, **kwargs):
-                    logger.info("🎬 CapturingVideoWriter.__init__() called!")
-                    logger.info(f"   args: {args}")
-                    logger.info(f"   kwargs: {kwargs}")
-                    super().__init__(*args, **kwargs)
-                    self.frame_count_internal = 0
-                    logger.info(f"✅ CapturingVideoWriter initialized successfully!")
-                
-                def __call__(self, frame_rgb, fmt="rgb"):
-                    """Intercept frame writes and capture them."""
-                    self.frame_count_internal += 1
-                    
-                    if self.frame_count_internal == 1:
-                        logger.info(f"🎉 FIRST FRAME RECEIVED IN WRITER!")
-                        logger.info(f"   Frame type: {type(frame_rgb)}")
-                        logger.info(f"   Frame shape: {frame_rgb.shape if isinstance(frame_rgb, np.ndarray) else 'N/A'}")
-                    
-                    if isinstance(frame_rgb, np.ndarray):
-                        frame_capture_queue.put(frame_rgb.copy())
-                        frame_count[0] += 1
-                        
-                        if frame_save_dir:
-                            frame_path = os.path.join(frame_save_dir, f"frame_{frame_count[0]:06d}.png")
-                            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                            cv2.imwrite(frame_path, frame_bgr)
-                        
-                        if frame_count[0] % 25 == 0:
-                            logger.info(f"DittoTalkingHeadService#0: Captured {frame_count[0]} frames")
-                        elif frame_count[0] <= 5:
-                            logger.info(f"DittoTalkingHeadService#0: Captured frame #{frame_count[0]}")
-                    else:
-                        logger.warning(f"Writer received non-ndarray: {type(frame_rgb)}")
-                    
-                    return super().__call__(frame_rgb, fmt)
-            
-            # Monkey-patch the VideoWriterByImageIO class BEFORE setup
-            import core.atomic_components.writer as writer_module
-            original_writer_class = writer_module.VideoWriterByImageIO
-            
-            logger.info(f"{self}: Original writer class: {original_writer_class}")
-            logger.info(f"{self}: About to replace with: {CapturingVideoWriter}")
-            
-            writer_module.VideoWriterByImageIO = CapturingVideoWriter
-            
-            logger.info(f"{self}: Writer class replaced in module")
-            logger.info(f"{self}: Module VideoWriterByImageIO is now: {writer_module.VideoWriterByImageIO}")
-
-            # NOW call setup
+            # Call setup FIRST (this creates writer and starts threads)
             logger.info(f"{self}: Calling SDK.setup()...")
             self._sdk.setup(
                 source_path=self._source_image_path,
@@ -211,18 +153,42 @@ class DittoTalkingHeadService(FrameProcessor):
             )
             logger.info(f"{self}: SDK.setup() completed")
 
-            # Check what writer was actually created
-            logger.info(f"{self}: Checking SDK writer after setup...")
-            if hasattr(self._sdk, 'writer'):
-                logger.info(f"{self}: SDK writer type: {type(self._sdk.writer)}")
-                logger.info(f"{self}: SDK writer class name: {self._sdk.writer.__class__.__name__}")
-                logger.info(f"{self}: Is instance of CapturingVideoWriter: {isinstance(self._sdk.writer, CapturingVideoWriter)}")
-            else:
-                logger.error(f"{self}: SDK has no 'writer' attribute after setup!")
-
-            # Restore original writer class
-            writer_module.VideoWriterByImageIO = original_writer_class
-
+            # NOW patch the writer instance's __call__ method directly
+            logger.info(f"{self}: Patching writer instance...")
+            
+            original_writer = self._sdk.writer
+            original_call = original_writer.__call__
+            
+            frame_capture_queue = queue_module.Queue()
+            frame_save_dir = self._save_frames_dir
+            frame_count = [0]
+            
+            def patched_call(frame_rgb, fmt="rgb"):
+                """Intercept frame writes."""
+                if isinstance(frame_rgb, np.ndarray):
+                    frame_capture_queue.put(frame_rgb.copy())
+                    frame_count[0] += 1
+                    
+                    if frame_save_dir:
+                        frame_path = os.path.join(frame_save_dir, f"frame_{frame_count[0]:06d}.png")
+                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        cv2.imwrite(frame_path, frame_bgr)
+                    
+                    if frame_count[0] == 1:
+                        logger.info(f"🎉 FIRST FRAME CAPTURED!")
+                    elif frame_count[0] % 25 == 0:
+                        logger.info(f"DittoTalkingHeadService#0: Captured {frame_count[0]} frames")
+                    elif frame_count[0] <= 5:
+                        logger.info(f"DittoTalkingHeadService#0: Captured frame #{frame_count[0]}")
+                
+                return original_call(frame_rgb, fmt)
+            
+            # Replace the instance method
+            import types
+            self._sdk.writer.__call__ = types.MethodType(patched_call, self._sdk.writer)
+            
+            logger.info(f"{self}: Writer instance patched successfully")
+            
             # Store the frame capture queue
             self._frame_capture_queue = frame_capture_queue
 
