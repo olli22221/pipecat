@@ -171,9 +171,9 @@ class DittoTalkingHeadService(FrameProcessor):
             sys.path.insert(0, self._ditto_path)
             from stream_pipeline_online import StreamSDK
 
-            # Initialize SDK
+            # Initialize SDK with online_mode=True for real-time streaming
             logger.info(f"{self}: Initializing Ditto StreamSDK...")
-            self._sdk = StreamSDK(self._cfg_pkl, self._data_root)
+            self._sdk = StreamSDK(self._cfg_pkl, self._data_root, online_mode=True)
 
             # Log online_mode if available
             if hasattr(self._sdk, 'online_mode'):
