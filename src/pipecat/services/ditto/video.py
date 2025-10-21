@@ -117,6 +117,11 @@ class DittoTalkingHeadService(FrameProcessor):
         # SDK access lock to prevent concurrent run_chunk calls
         self._sdk_lock = asyncio.Lock()
 
+        # Audio-Video synchronization
+        self._audio_frame_buffer = []  # Buffer TTSAudioRawFrame for sync
+        self._video_frames_per_audio_chunk = 8  # Ditto generates ~8 frames per 405ms audio chunk
+        self._audio_chunk_counter = 0  # Track audio chunks processed
+
         # Create save directory if specified
         if self._save_frames_dir:
             os.makedirs(self._save_frames_dir, exist_ok=True)
@@ -370,6 +375,12 @@ class DittoTalkingHeadService(FrameProcessor):
             self._is_speaking = True  # Set speaking flag immediately when TTS starts
             self._audio_buffer.clear()
 
+            # Clear audio frame buffer from previous utterance
+            audio_buffer_size = len(self._audio_frame_buffer)
+            self._audio_frame_buffer.clear()
+            if audio_buffer_size > 0:
+                logger.info(f"{self}: Cleared {audio_buffer_size} buffered audio frames")
+
             # Clear any queued idle frames to prevent them from playing during speech
             cleared_count = 0
             while not self._video_frame_queue.empty():
@@ -387,7 +398,12 @@ class DittoTalkingHeadService(FrameProcessor):
             if not self._initialized or self._is_interrupting:
                 pass
             else:
-                # Queue audio for processing
+                # Buffer audio frame for sync with video
+                # Don't push it through yet - we'll release it when video is ready
+                self._audio_frame_buffer.append(frame)
+                logger.debug(f"{self}: Buffered audio frame (buffer size: {len(self._audio_frame_buffer)})")
+
+                # Queue audio for processing by Ditto
                 await self._audio_queue.put(frame)
 
         elif isinstance(frame, TTSStoppedFrame):
@@ -403,13 +419,18 @@ class DittoTalkingHeadService(FrameProcessor):
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self.stop(frame)
 
-        await self.push_frame(frame, direction)
+        # Don't push TTSAudioRawFrame immediately - it's buffered and will be released in sync with video
+        if not isinstance(frame, TTSAudioRawFrame):
+            await self.push_frame(frame, direction)
 
     async def _handle_interruption(self):
         """Handle user interruption by stopping audio processing and restarting."""
         self._is_interrupting = True
         self._audio_buffer.clear()
         self._event_id = None
+
+        # Clear audio frame buffer
+        self._audio_frame_buffer.clear()
 
         # Cancel and restart audio task
         await self._cancel_audio_task()
@@ -664,10 +685,21 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily."""
+        """Consume video frames from queue and push to Daily.
+
+        Also releases buffered audio frames in sync with video to maintain A/V sync.
+        """
         logger.info(f"{self}: Video playback task started")
-        
+
         frames_pushed = 0
+        audio_frames_released = 0
+        frames_since_audio_release = 0
+
+        # Release one audio frame for every N video frames to maintain sync
+        # Ditto generates ~8 video frames per 405ms audio chunk at 20fps
+        # TTS audio frames are smaller chunks, so we release more frequently
+        AUDIO_RELEASE_INTERVAL = 2  # Release audio every 2 video frames
+
         try:
             while True:
                 try:
@@ -676,28 +708,38 @@ class DittoTalkingHeadService(FrameProcessor):
                         self._video_frame_queue.get(),
                         timeout=0.1
                     )
-                    
+
                     if frame is None:
                         logger.info(f"{self}: Received None, stopping video playback")
                         break
-                    
+
                     frames_pushed += 1
-                    
+                    frames_since_audio_release += 1
+
                     if frames_pushed == 1:
                         logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
                     elif frames_pushed % 10 == 0:
-                        logger.info(f"{self}: Pushed {frames_pushed} frames to Daily")
-                    
+                        logger.info(f"{self}: Pushed {frames_pushed} video frames, released {audio_frames_released} audio frames (buffer: {len(self._audio_frame_buffer)})")
+
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
                         image=frame,
                         size=(frame.shape[1], frame.shape[0]),  # (width, height)
                         format="RGB"
                     )
-                    
-                    # Push to pipeline (this sends to Daily)
+
+                    # Push video frame to pipeline
                     await self.push_frame(output_frame)
-                    logger.debug(f"{self}: Pushed frame {frames_pushed} to Daily")
+                    logger.debug(f"{self}: Pushed video frame {frames_pushed}")
+
+                    # Release buffered audio frames in sync with video
+                    if frames_since_audio_release >= AUDIO_RELEASE_INTERVAL and self._audio_frame_buffer:
+                        # Release one audio frame
+                        audio_frame = self._audio_frame_buffer.pop(0)
+                        await self.push_frame(audio_frame, FrameDirection.DOWNSTREAM)
+                        audio_frames_released += 1
+                        frames_since_audio_release = 0
+                        logger.debug(f"{self}: Released audio frame (buffer: {len(self._audio_frame_buffer)} remaining)")
                     
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
