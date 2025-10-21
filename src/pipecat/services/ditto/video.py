@@ -581,6 +581,9 @@ class DittoTalkingHeadService(FrameProcessor):
         """
         logger.info(f"{self}: Frame reader task started")
 
+        frame_counter = 0
+        fps = 25
+
         try:
             while self._frame_reader_running:
                 try:
@@ -599,6 +602,15 @@ class DittoTalkingHeadService(FrameProcessor):
                     # Convert frame to OutputImageRawFrame
                     if isinstance(frame_rgb, np.ndarray):
                         height, width = frame_rgb.shape[:2]
+
+                        # Resize to 512x512 to match Daily transport configuration
+                        # Ditto generates frames at 1440x1920, but we need to match the transport output size
+                        target_width, target_height = 512, 512
+                        if width != target_width or height != target_height:
+                            logger.debug(f"{self}: Resizing frame from {width}x{height} to {target_width}x{target_height}")
+                            frame_rgb = cv2.resize(frame_rgb, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+                            width, height = target_width, target_height
+
                         frame_bytes = frame_rgb.tobytes()
 
                         output_frame = OutputImageRawFrame(
@@ -607,10 +619,14 @@ class DittoTalkingHeadService(FrameProcessor):
                             format="RGB"
                         )
 
+                        # Set PTS (presentation timestamp) for video synchronization
+                        # Following Simli's pattern for proper timing
+                        output_frame.pts = frame_counter
+                        frame_counter += 1
+
                         # Queue for playback at correct frame rate (25fps)
-                        fps = 25
                         await self._video_queue.put((output_frame, 1.0 / fps))
-                        logger.debug(f"{self}: Queued video frame {width}x{height}")
+                        logger.debug(f"{self}: Queued video frame {width}x{height} (pts={output_frame.pts})")
 
                 except queue_module.Empty:
                     # No frame available yet
