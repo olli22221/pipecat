@@ -181,8 +181,24 @@ class DittoTalkingHeadService(FrameProcessor):
             else:
                 logger.info(f"{self}: SDK initialized (online_mode attribute not available)")
 
-            # Replace SDK's writer BEFORE calling setup()
-            # setup() starts the worker threads, so we must replace the writer first
+            # Setup SDK with source image and temporary output path
+            import tempfile
+            temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
+
+            # CRITICAL: This is where the source image is loaded and processed
+            # The SDK will use this image for all video generation in this session
+            # This also starts the worker threads
+            logger.info(f"{self}: Loading avatar image and setting up SDK...")
+            self._sdk.setup(
+                source_path=self._source_image_path,  # Avatar face image loaded here
+                output_path=temp_output,
+            )
+            logger.info(f"{self}: SDK setup completed, worker threads started")
+            logger.info(f"{self}: Original writer type: {type(self._sdk.writer)}")
+
+            # Replace SDK's writer AFTER setup() completes
+            # setup() creates a VideoWriter object and starts worker threads
+            # We replace it so the worker threads call our custom capturer instead
             frame_count = [0]  # Use list to allow mutation in nested function
 
             def custom_writer(frame_rgb, fmt="rgb"):
@@ -202,22 +218,8 @@ class DittoTalkingHeadService(FrameProcessor):
                     traceback.print_exc()
 
             self._sdk.writer = custom_writer
-            logger.info(f"{self}: Replaced SDK writer with custom frame capturer (BEFORE setup)")
-            logger.debug(f"{self}: SDK writer type: {type(self._sdk.writer)}")
-
-            # Setup SDK with source image and temporary output path
-            import tempfile
-            temp_output = os.path.join(tempfile.gettempdir(), f"ditto_output_{id(self)}.mp4")
-
-            # CRITICAL: This is where the source image is loaded and processed
-            # The SDK will use this image for all video generation in this session
-            # This also starts the worker threads which will call our custom writer
-            logger.info(f"{self}: Loading avatar image and setting up SDK...")
-            self._sdk.setup(
-                source_path=self._source_image_path,  # Avatar face image loaded here
-                output_path=temp_output,
-            )
-            logger.info(f"{self}: SDK setup completed, worker threads started")
+            logger.info(f"{self}: Replaced SDK writer with custom frame capturer (AFTER setup)")
+            logger.debug(f"{self}: New writer type: {type(self._sdk.writer)}")
 
             # Start background task to read frames from SDK's writer_queue
             self._frame_reader_running = True
