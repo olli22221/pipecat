@@ -567,72 +567,54 @@ class DittoTalkingHeadService(FrameProcessor):
         logger.info(f"{self}: Final queue status after monitoring: {queue_status}")
 
     async def _finalize_audio(self):
-        """Process any remaining audio when TTS completes."""
+        """Process any remaining audio in the buffer after TTS stops."""
+        if len(self._audio_buffer) == 0:
+            return
+            
         logger.info(f"{self}: Finalizing audio processing, buffer has {len(self._audio_buffer)} samples")
-
-        future_samples = self._chunk_size[2] * 640
-        if future_samples > 0 and not self._interrupted:
-            logger.info(f"{self}: Adding {future_samples} samples of future padding")
-            future_padding = np.zeros((future_samples,), dtype=np.float32)
-            self._audio_buffer.extend(future_padding.tolist())
-            logger.info(f"{self}: After padding, buffer has {len(self._audio_buffer)} samples")
-
-        stride_samples = self._chunk_size[1] * 640
-        split_len = int(sum(self._chunk_size) * 0.04 * 16000) + 80
-
-        logger.info(f"{self}: Processing remaining chunks (stride={stride_samples}, split_len={split_len})")
-
+        
+        # Add future context padding
+        padding_samples = 1280  # 2 frames * 640
+        logger.info(f"{self}: Adding {padding_samples} samples of future padding")
+        
+        # Pad with last sample repeated (or zeros if buffer empty)
+        if len(self._audio_buffer) > 0:
+            last_sample = self._audio_buffer[-1]
+            future_padding = np.full(padding_samples, last_sample, dtype=np.float32)
+            self._audio_buffer = np.concatenate([self._audio_buffer, future_padding])  # ← Changed from extend
+        
+        logger.info(f"{self}: After padding, buffer has {len(self._audio_buffer)} samples")
+        
+        # Process remaining chunks
+        logger.info(f"{self}: Processing remaining chunks (chunk_size=6480)")
+        
         iteration = 0
-        while len(self._audio_buffer) >= stride_samples and not self._interrupted:
+        while len(self._audio_buffer) >= 6480:
             iteration += 1
-            buffer_size_before = len(self._audio_buffer)
-            logger.debug(f"{self}: Iteration {iteration}: buffer size = {buffer_size_before}")
-
-            await self._process_audio_chunks()
-
-            buffer_size_after = len(self._audio_buffer)
-
-            if buffer_size_before == buffer_size_after:
-                logger.info(f"{self}: Buffer unchanged at {buffer_size_after} samples, processing final partial chunk")
-                if buffer_size_after > 0:
-                    async with self._processing_lock:
-                        audio_chunk = np.array(self._audio_buffer, dtype=np.float32)
-                        if len(audio_chunk) < split_len:
-                            audio_chunk = np.pad(
-                                audio_chunk,
-                                (0, split_len - len(audio_chunk)),
-                                mode="constant"
-                            )
-
-                        logger.info(f"{self}: Processing final padded chunk of {len(audio_chunk)} samples")
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, self._run_chunk, audio_chunk)
-
-                        self._audio_buffer = []
-                        logger.info(f"{self}: Final chunk processed, buffer cleared")
-                break
-
-        logger.info(f"{self}: Audio processing finalized")
-
-        # Wait for frames to propagate
-        logger.info(f"{self}: Waiting for frames to propagate through pipeline...")
-        for i in range(6):
-            await asyncio.sleep(1.0)
-
-            # Check all queues for frames
-            found_frames = False
-            for attr_name in dir(self._sdk):
-                try:
-                    attr = getattr(self._sdk, attr_name)
-                    if hasattr(attr, 'qsize') and attr.qsize() > 0:
-                        logger.info(f"{self}: Found {attr.qsize()} items in {attr_name}")
-                        found_frames = True
-                except:
-                    pass
-
-            if found_frames:
-                logger.info(f"{self}: Frames detected in SDK queues!")
-                break
+            logger.debug(f"{self}: Iteration {iteration}: buffer size = {len(self._audio_buffer)}")
+            
+            chunk = self._audio_buffer[:6480]
+            self._audio_buffer = self._audio_buffer[6480:]  # ← Changed from list slicing (still works)
+            
+            # Process this chunk
+            await self._process_single_chunk(chunk)
+        
+        # Process final partial chunk if any remains
+        if len(self._audio_buffer) > 0:
+            logger.info(f"{self}: Processing final partial chunk ({len(self._audio_buffer)} samples)")
+            # Pad to minimum size if needed
+            if len(self._audio_buffer) < 6480:
+                padding_needed = 6480 - len(self._audio_buffer)
+                final_padding = np.full(padding_needed, self._audio_buffer[-1], dtype=np.float32)
+                final_chunk = np.concatenate([self._audio_buffer, final_padding])
+            else:
+                final_chunk = self._audio_buffer
+            
+            await self._process_single_chunk(final_chunk)
+        
+        # Clear buffer
+        self._audio_buffer = np.array([], dtype=np.float32)
+        logger.info(f"{self}: Finalization complete")
 
     async def _read_frames_from_sdk(self):
         """Read frames from SDK's capture queue and add to video playback queue."""
