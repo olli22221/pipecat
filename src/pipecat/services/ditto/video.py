@@ -360,8 +360,11 @@ class DittoTalkingHeadService(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames from the pipeline."""
         # Log ALL frames to debug what's flowing through
+        frame_type = type(frame).__name__
+        logger.warning(f"{self}: 🔍 process_frame received: {frame_type} (direction={direction})")
+
         if isinstance(frame, (TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame)):
-            logger.warning(f"{self}: 🔍 process_frame received: {type(frame).__name__}")
+            logger.error(f"{self}: ❗❗❗ TTS FRAME DETECTED: {frame_type} ❗❗❗")
 
         await super().process_frame(frame, direction)
 
