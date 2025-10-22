@@ -366,8 +366,7 @@ class DittoTalkingHeadService(FrameProcessor):
         if isinstance(frame, (TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame)):
             logger.error(f"{self}: ❗❗❗ TTS FRAME DETECTED: {frame_type} ❗❗❗")
 
-        await super().process_frame(frame, direction)
-
+        # Handle our frames BEFORE calling super() - this ensures we intercept them!
         if isinstance(frame, StartFrame):
             await self.start(frame)
 
@@ -410,8 +409,9 @@ class DittoTalkingHeadService(FrameProcessor):
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self.stop(frame)
 
-        # Push all frames downstream
-        await self.push_frame(frame, direction)
+        # Call parent class to handle frame routing through the pipeline
+        # This ensures frames are properly passed downstream
+        await super().process_frame(frame, direction)
 
     async def _handle_interruption(self):
         """Handle user interruption by stopping audio processing and restarting."""
