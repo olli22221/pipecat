@@ -488,25 +488,8 @@ class DittoTalkingHeadService(FrameProcessor):
                 # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
 
-                # Push audio immediately with timestamp
-                # WebRTC will use timestamps to synchronize with video
-                # Set base timestamp on first audio frame
-                if self._base_timestamp is None:
-                    self._base_timestamp = asyncio.get_event_loop().time()
-                    logger.info(f"{self}: Base timestamp set: {self._base_timestamp}")
-
-                # Calculate timestamp for this audio chunk
-                audio_timestamp = self._base_timestamp + (self._audio_samples_pushed / frame.sample_rate)
-
-                # Add timestamp metadata if the frame supports it
-                if hasattr(frame, 'pts'):
-                    frame.pts = audio_timestamp
-
-                # Update samples counter
-                num_samples = len(frame.audio) // 2  # 16-bit = 2 bytes per sample
-                self._audio_samples_pushed += num_samples
-
-                logger.info(f"{self}: Pushing TTS audio ({len(frame.audio)} bytes, {num_samples} samples, timestamp: {audio_timestamp:.3f}s)")
+                # Push audio immediately - let transport handle pacing
+                logger.info(f"{self}: Pushing TTS audio ({len(frame.audio)} bytes)")
                 await self.push_frame(frame, direction)
                 return  # Don't push again at the end
 
@@ -818,11 +801,10 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily with timestamps.
+        """Consume video frames from queue and push to Daily.
 
-        Video frames are pushed with timestamps for WebRTC synchronization.
-        Audio is pushed separately (in TTSAudioRawFrame processing) with matching timestamps.
-        WebRTC transport uses timestamps to maintain perfect audio-video sync.
+        Pushes video frames as they arrive from Ditto generation.
+        Transport layer handles pacing and synchronization naturally.
         """
         logger.info(f"{self}: Video playback task started")
 
@@ -848,33 +830,17 @@ class DittoTalkingHeadService(FrameProcessor):
                     elif frames_pushed % 10 == 0:
                         logger.info(f"{self}: Pushed {frames_pushed} video frames to Daily")
 
-                    # Calculate timestamp for this video frame
-                    # timestamp = base + (frames_pushed / fps)
-                    # Note: base_timestamp set when first audio arrives
-                    if self._base_timestamp is not None:
-                        video_timestamp = self._base_timestamp + (self._video_frames_pushed / 20.0)  # 20fps
-                    else:
-                        # Fallback if no audio yet
-                        video_timestamp = asyncio.get_event_loop().time()
-
-                    # Create OutputImageRawFrame for Daily with timestamp
+                    # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
                         image=frame,
                         size=(frame.shape[1], frame.shape[0]),  # (width, height)
                         format="RGB"
                     )
 
-                    # Add timestamp metadata if the frame supports it
-                    if hasattr(output_frame, 'pts'):
-                        output_frame.pts = video_timestamp
-
-                    # Push video frame to pipeline
+                    # Push video frame to pipeline immediately
                     await self.push_frame(output_frame)
 
-                    # Update video frames counter
-                    self._video_frames_pushed += 1
-
-                    logger.debug(f"{self}: Pushed video frame {frames_pushed} (timestamp: {video_timestamp:.3f}s)")
+                    logger.debug(f"{self}: Pushed video frame {frames_pushed}")
 
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
