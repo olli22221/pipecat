@@ -102,6 +102,10 @@ class DittoTalkingHeadService(FrameProcessor):
         self._event_id = None  # Track current utterance
         self._is_interrupting = False  # Interrupt flag
         self._resampler = create_stream_resampler()  # Audio resampler
+
+        # Audio-video synchronization
+        self._tts_audio_frames = []  # Buffer of TTSAudioRawFrame for sync
+        self._audio_bytes_to_push = bytearray()  # Accumulated audio bytes to push with video
         
         # Frame reading/playback state
         self._frame_reader_running = False
@@ -410,7 +414,12 @@ class DittoTalkingHeadService(FrameProcessor):
             if not self._initialized or self._is_interrupting:
                 pass
             else:
-                # Queue audio for processing by Ditto
+                # Store audio frame for synchronized playback with video
+                self._tts_audio_frames.append(frame)
+                self._audio_bytes_to_push.extend(frame.audio)
+                logger.info(f"{self}: Stored TTS audio frame (size={len(frame.audio)} bytes, total buffered={len(self._audio_bytes_to_push)} bytes)")
+
+                # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
 
         elif isinstance(frame, TTSStoppedFrame):
@@ -429,8 +438,11 @@ class DittoTalkingHeadService(FrameProcessor):
         # Call parent class to handle system frames and observers
         await super().process_frame(frame, direction)
 
-        # Push frame downstream to continue pipeline (audio to Daily, etc.)
-        await self.push_frame(frame, direction)
+        # Push frame downstream EXCEPT TTSAudioRawFrame (we'll push audio synchronized with video)
+        if not isinstance(frame, TTSAudioRawFrame):
+            await self.push_frame(frame, direction)
+        else:
+            logger.info(f"{self}: Skipping immediate push of TTSAudioRawFrame - will sync with video")
 
     async def _handle_interruption(self):
         """Handle user interruption by stopping audio processing and restarting."""
@@ -697,10 +709,19 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily."""
+        """Consume video frames from queue and push to Daily synchronized with audio."""
         logger.info(f"{self}: Video playback task started")
 
         frames_pushed = 0
+        audio_sample_rate = 24000  # TTS output sample rate (Higgs Audio)
+        video_fps = 30  # Target video frame rate
+
+        # Calculate audio bytes per video frame for synchronization
+        # At 24kHz and 30fps: (24000 samples/sec) / (30 frames/sec) = 800 samples/frame
+        # At 2 bytes per sample (int16): 800 * 2 = 1600 bytes/frame
+        audio_bytes_per_frame = int((audio_sample_rate / video_fps) * 2)  # *2 for int16
+
+        logger.info(f"{self}: Audio-video sync: {audio_bytes_per_frame} bytes audio per video frame")
 
         try:
             while True:
@@ -722,6 +743,27 @@ class DittoTalkingHeadService(FrameProcessor):
                     elif frames_pushed % 10 == 0:
                         logger.info(f"{self}: Pushed {frames_pushed} video frames to Daily")
 
+                    # Push synchronized audio chunk with this video frame
+                    if len(self._audio_bytes_to_push) >= audio_bytes_per_frame:
+                        # Extract audio chunk for this video frame
+                        audio_chunk = bytes(self._audio_bytes_to_push[:audio_bytes_per_frame])
+                        self._audio_bytes_to_push = self._audio_bytes_to_push[audio_bytes_per_frame:]
+
+                        # Get reference frame for sample rate
+                        ref_frame = self._tts_audio_frames[0] if self._tts_audio_frames else None
+                        if ref_frame:
+                            # Create TTSAudioRawFrame for this chunk
+                            audio_frame = TTSAudioRawFrame(
+                                audio=audio_chunk,
+                                sample_rate=ref_frame.sample_rate,
+                                num_channels=ref_frame.num_channels
+                            )
+                            # Push audio synchronized with video
+                            await self.push_frame(audio_frame)
+                            logger.debug(f"{self}: Pushed {len(audio_chunk)} bytes of audio with video frame {frames_pushed}")
+                    elif self._is_speaking:
+                        logger.debug(f"{self}: Waiting for audio buffer to fill (have {len(self._audio_bytes_to_push)} bytes, need {audio_bytes_per_frame})")
+
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
                         image=frame,
@@ -732,7 +774,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     # Push video frame to pipeline
                     await self.push_frame(output_frame)
                     logger.debug(f"{self}: Pushed video frame {frames_pushed}")
-                    
+
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
                     continue
@@ -741,7 +783,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     import traceback
                     traceback.print_exc()
                     break
-        
+
         except asyncio.CancelledError:
             logger.info(f"{self}: Video playback task cancelled")
         except Exception as e:
