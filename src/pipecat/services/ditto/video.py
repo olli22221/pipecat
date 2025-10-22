@@ -449,36 +449,14 @@ class DittoTalkingHeadService(FrameProcessor):
             if not self._initialized or self._is_interrupting:
                 pass
             else:
-                # Resample audio to 16kHz for synchronization
-                audio_resampled = await self._resampler.resample(
-                    frame.audio, frame.sample_rate, self._audio_sample_rate
-                )
-
-                # Add to accumulator for re-chunking into 50ms video-aligned portions
-                self._audio_accumulator.extend(audio_resampled)
-                logger.debug(f"{self}: Added {len(audio_resampled)} bytes to accumulator, total: {len(self._audio_accumulator)} bytes")
-
-                # Create 50ms audio chunks (800 samples at 16kHz = 1600 bytes) to match video frame rate
-                chunk_size_bytes = self._samples_per_video_frame * 2  # int16 = 2 bytes per sample
-                while len(self._audio_accumulator) >= chunk_size_bytes:
-                    # Extract one 50ms audio chunk
-                    audio_chunk_bytes = bytes(self._audio_accumulator[:chunk_size_bytes])
-                    self._audio_accumulator = self._audio_accumulator[chunk_size_bytes:]
-
-                    # Create TTSAudioRawFrame for this 50ms chunk (matches one video frame)
-                    synced_frame = TTSAudioRawFrame(
-                        audio=audio_chunk_bytes,
-                        sample_rate=self._audio_sample_rate,
-                        num_channels=1
-                    )
-
-                    # Queue for synchronized playback with video
-                    await self._synced_audio_queue.put(synced_frame)
-                    logger.debug(f"{self}: Created synced 50ms audio frame, queue size: {self._synced_audio_queue.qsize()}")
-
                 # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
-                return  # Don't push audio independently - it will be synchronized with video
+
+                # Push audio frame immediately for smooth playback
+                # Video frames will follow as they're generated
+                logger.info(f"{self}: Pushing TTS audio frame ({len(frame.audio)} bytes) immediately")
+                await self.push_frame(frame, direction)
+                return  # Don't push again at the end
 
         elif isinstance(frame, TTSStoppedFrame):
             # The timeout in _audio_task_handler will handle finalization
@@ -543,9 +521,6 @@ class DittoTalkingHeadService(FrameProcessor):
         was_speaking = False  # Track state changes for logging
 
         try:
-            # Wait a bit for SDK to fully initialize
-            await asyncio.sleep(0.5)
-
             # Calculate frame interval for target FPS
             frame_interval = 1.0 / self._target_fps  # seconds between frames
             ditto_native_fps = 20  # Ditto's native output FPS
@@ -782,26 +757,21 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push synchronized 1:1 with audio to Daily.
-
-        For each video frame, pushes exactly one 50ms audio chunk to ensure perfect sync.
-        Audio has been pre-chunked to 50ms portions to match video frame rate (20fps).
-        """
-        logger.info(f"{self}: Video playback task started (with 1:1 audio-video sync)")
+        """Consume video frames from queue and push to Daily."""
+        logger.info(f"{self}: Video playback task started")
 
         frames_pushed = 0
-        audio_frames_pushed = 0
 
         try:
             while True:
                 try:
-                    # Get video frame from the queue (with timeout to check for cancellation)
-                    video_frame = await asyncio.wait_for(
+                    # Get frame from the queue (with timeout to check for cancellation)
+                    frame = await asyncio.wait_for(
                         self._video_frame_queue.get(),
                         timeout=0.1
                     )
 
-                    if video_frame is None:
+                    if frame is None:
                         logger.info(f"{self}: Received None, stopping video playback")
                         break
 
@@ -812,24 +782,10 @@ class DittoTalkingHeadService(FrameProcessor):
                     elif frames_pushed % 10 == 0:
                         logger.info(f"{self}: Pushed {frames_pushed} video frames to Daily")
 
-                    # For speech frames, push exactly one 50ms audio chunk with each video frame
-                    # This ensures 1:1 correspondence
-                    if self._is_speaking and not self._synced_audio_queue.empty():
-                        try:
-                            # Get one 50ms audio chunk (matches this video frame's duration)
-                            audio_frame = self._synced_audio_queue.get_nowait()
-
-                            # Push audio frame BEFORE video frame for synchronization
-                            await self.push_frame(audio_frame)
-                            audio_frames_pushed += 1
-                            logger.info(f"{self}: 🔊 Pushed 1:1 synced audio frame ({len(audio_frame.audio)} bytes, 50ms) with video #{frames_pushed}")
-                        except asyncio.QueueEmpty:
-                            logger.warning(f"{self}: ⚠️ No synced audio available for video frame {frames_pushed}")
-
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
-                        image=video_frame,
-                        size=(video_frame.shape[1], video_frame.shape[0]),  # (width, height)
+                        image=frame,
+                        size=(frame.shape[1], frame.shape[0]),  # (width, height)
                         format="RGB"
                     )
 
@@ -853,4 +809,4 @@ class DittoTalkingHeadService(FrameProcessor):
             import traceback
             traceback.print_exc()
         finally:
-            logger.info(f"{self}: Video playback finished (pushed {frames_pushed} video frames, {audio_frames_pushed} audio frames in 1:1 sync)")
+            logger.info(f"{self}: Video playback finished (pushed {frames_pushed} frames)")
