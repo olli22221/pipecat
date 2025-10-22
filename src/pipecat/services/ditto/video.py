@@ -582,10 +582,11 @@ class DittoTalkingHeadService(FrameProcessor):
         was_speaking = False  # Track state changes for logging
 
         try:
-            # Feed chunks more frequently for smoother, higher FPS idle video
-            # We'll feed smaller "virtual" chunks by sleeping less between SDK calls
-            # Target: ~30fps output, so feed every ~0.1 seconds
-            chunk_interval = 0.15  # Feed chunks every 150ms for smoother playback
+            # Feed silent audio chunks at their natural rate
+            # Each chunk is 6480 samples at 16kHz = 405ms duration
+            # This matches the timing of speech audio chunks for consistent frame generation
+            chunk_duration = 6480 / 16000.0  # 0.405 seconds
+            chunk_interval = chunk_duration  # Feed at natural audio rate
 
             while True:
                 start_time = asyncio.get_event_loop().time()
