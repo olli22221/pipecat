@@ -452,9 +452,14 @@ class DittoTalkingHeadService(FrameProcessor):
                 # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
 
-                # Push audio frame immediately for smooth playback
-                # Video frames will follow as they're generated
-                logger.info(f"{self}: Pushing TTS audio frame ({len(frame.audio)} bytes) immediately")
+                # Wait briefly for video frames to start generating before pushing audio
+                # This helps keep audio and video synchronized
+                if self._video_frame_queue.qsize() < 3:
+                    logger.debug(f"{self}: Waiting for video frames to generate (queue size: {self._video_frame_queue.qsize()})")
+                    await asyncio.sleep(0.1)  # Small delay to let video catch up
+
+                # Push audio frame for smooth playback
+                logger.info(f"{self}: Pushing TTS audio frame ({len(frame.audio)} bytes)")
                 await self.push_frame(frame, direction)
                 return  # Don't push again at the end
 
@@ -521,10 +526,10 @@ class DittoTalkingHeadService(FrameProcessor):
         was_speaking = False  # Track state changes for logging
 
         try:
-            # Each audio chunk is 6480 samples at 16kHz = 0.405 seconds
-            # At 20fps, this generates ~8 frames
-            # So we should feed one chunk every 0.4 seconds for natural 20fps playback
-            chunk_duration = 6480 / 16000  # 0.405 seconds
+            # Feed chunks more frequently for smoother, higher FPS idle video
+            # We'll feed smaller "virtual" chunks by sleeping less between SDK calls
+            # Target: ~30fps output, so feed every ~0.1 seconds
+            chunk_interval = 0.15  # Feed chunks every 150ms for smoother playback
 
             while True:
                 start_time = asyncio.get_event_loop().time()
@@ -550,9 +555,9 @@ class DittoTalkingHeadService(FrameProcessor):
                     queue_size = self._video_frame_queue.qsize()
                     if queue_size > 20:  # Don't let queue get too full
                         logger.debug(f"{self}: Video queue has {queue_size} frames, skipping idle generation")
-                        # Sleep for chunk duration to maintain timing
+                        # Sleep to maintain timing
                         elapsed = asyncio.get_event_loop().time() - start_time
-                        sleep_time = max(0, chunk_duration - elapsed)
+                        sleep_time = max(0, chunk_interval - elapsed)
                         await asyncio.sleep(sleep_time)
                         continue
 
@@ -601,10 +606,9 @@ class DittoTalkingHeadService(FrameProcessor):
                         logger.info(f"{self}: ===== IDLE mode paused - bot is speaking (_is_speaking = {self._is_speaking}) =====")
                         was_speaking = True
 
-                # Sleep for the duration of the audio chunk to maintain natural timing
-                # Each chunk represents 0.405s of audio, generating ~8 frames at 20fps
+                # Sleep for the chunk interval to maintain smooth frame generation
                 elapsed = asyncio.get_event_loop().time() - start_time
-                sleep_time = max(0, chunk_duration - elapsed)
+                sleep_time = max(0, chunk_interval - elapsed)
                 await asyncio.sleep(sleep_time)
 
         except asyncio.CancelledError:
