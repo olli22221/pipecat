@@ -353,9 +353,15 @@ class DittoTalkingHeadService(FrameProcessor):
                     logger.info(f"{self}: Timeout detected, finalizing utterance {self._event_id}")
                     await self._finalize_audio()
                     self._event_id = None
+                    self._audio_buffer.clear()
+
+                    # Wait for video generation to complete before allowing idle frames
+                    # Ditto processes asynchronously, so give it time to finish
+                    logger.info(f"{self}: Waiting 2 seconds for video generation to complete...")
+                    await asyncio.sleep(2.0)
+
                     logger.info(f"{self}: ===== SPEECH FINALIZED - Setting _is_speaking = False =====")
                     self._is_speaking = False
-                    self._audio_buffer.clear()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames from the pipeline."""
