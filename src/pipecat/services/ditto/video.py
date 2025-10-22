@@ -113,6 +113,7 @@ class DittoTalkingHeadService(FrameProcessor):
         self._idle_frame_task = None
         self._last_frame = None  # Cache last generated frame for idle state
         self._is_speaking = False  # Track if currently generating speech frames
+        self._last_speech_frame_time = 0  # Track when last speech frame was generated
 
         # SDK access lock to prevent concurrent run_chunk calls
         self._sdk_lock = asyncio.Lock()
@@ -355,10 +356,25 @@ class DittoTalkingHeadService(FrameProcessor):
                     self._event_id = None
                     self._audio_buffer.clear()
 
-                    # Wait for video generation to complete before allowing idle frames
-                    # Ditto processes asynchronously, so give it time to finish
-                    logger.info(f"{self}: Waiting 2 seconds for video generation to complete...")
-                    await asyncio.sleep(2.0)
+                    # Wait for Ditto to finish generating video frames
+                    # Keep checking if frames are still being generated
+                    logger.info(f"{self}: Waiting for video frame generation to complete...")
+                    max_wait = 5.0  # Maximum 5 seconds
+                    check_interval = 0.2  # Check every 200ms
+                    waited = 0.0
+
+                    while waited < max_wait:
+                        current_time = asyncio.get_event_loop().time()
+                        time_since_last_frame = current_time - self._last_speech_frame_time
+
+                        # If no frames for 0.5 seconds, video generation is done
+                        if time_since_last_frame > 0.5:
+                            logger.info(f"{self}: No speech frames for {time_since_last_frame:.2f}s - video generation complete")
+                            break
+
+                        logger.debug(f"{self}: Still generating frames (last frame {time_since_last_frame:.2f}s ago)")
+                        await asyncio.sleep(check_interval)
+                        waited += check_interval
 
                     logger.info(f"{self}: ===== SPEECH FINALIZED - Setting _is_speaking = False =====")
                     self._is_speaking = False
@@ -682,6 +698,11 @@ class DittoTalkingHeadService(FrameProcessor):
                         logger.info(f"{self}: 🎉 FIRST FRAME CAPTURED!")
                     elif frames_read % 10 == 0:
                         logger.info(f"{self}: Read {frames_read} frames from SDK")
+
+                    # Track when speech frames are being generated
+                    if self._is_speaking:
+                        self._last_speech_frame_time = asyncio.get_event_loop().time()
+                        logger.debug(f"{self}: Speech frame generated at {self._last_speech_frame_time}")
 
                     # Cache the last frame for idle state
                     self._last_frame = frame.copy()
