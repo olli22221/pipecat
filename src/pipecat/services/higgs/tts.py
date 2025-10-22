@@ -188,6 +188,7 @@ class HiggsAudioTTSService(TTSService):
             await self.start_ttfb_metrics()
             
             # Signal TTS started
+            logger.warning(f"🔊🔊🔊 HIGGS TTS: Yielding TTSStartedFrame 🔊🔊🔊")
             yield TTSStartedFrame()
             
             # Create ChatML format messages
@@ -237,10 +238,12 @@ class HiggsAudioTTSService(TTSService):
                 sample_rate=output.sampling_rate,
                 num_channels=1
             )
-            
+
+            logger.warning(f"🔊🔊🔊 HIGGS TTS: Yielding TTSAudioRawFrame (size={len(audio_array.tobytes())} bytes) 🔊🔊🔊")
             yield frame
             
             # Signal TTS completed
+            logger.warning(f"🔊🔊🔊 HIGGS TTS: Yielding TTSStoppedFrame 🔊🔊🔊")
             yield TTSStoppedFrame()
             
             duration_secs = len(audio_array) / output.sampling_rate
