@@ -808,6 +808,10 @@ class DittoTalkingHeadService(FrameProcessor):
                     # Frames inherit the timestamp of the audio chunk that generated them
                     frame_with_timestamp = (frame, self._current_audio_chunk_timestamp)
 
+                    # Log frame tagging for debugging
+                    if frames_read <= 5:
+                        logger.info(f"{self}: Tagging frame {frames_read} with timestamp {self._current_audio_chunk_timestamp:.3f}s (base: {self._base_timestamp}, speaking: {self._is_speaking})")
+
                     # Add to video playback queue with backpressure handling
                     # If queue is too full, drop oldest frames to prevent unbounded growth
                     if self._video_frame_queue.qsize() >= self._max_video_queue_size:
@@ -870,7 +874,19 @@ class DittoTalkingHeadService(FrameProcessor):
                         break
 
                     # Unpack frame and its audio-derived timestamp
-                    frame, audio_timestamp = frame_data
+                    try:
+                        frame, audio_timestamp = frame_data
+                        logger.debug(f"{self}: Unpacked frame with timestamp {audio_timestamp:.3f}s")
+                    except (TypeError, ValueError) as e:
+                        logger.error(f"{self}: Failed to unpack frame_data: {e}, type: {type(frame_data)}")
+                        # If unpacking fails, might be getting raw frame instead of tuple
+                        if isinstance(frame_data, np.ndarray):
+                            frame = frame_data
+                            audio_timestamp = 0
+                            logger.warning(f"{self}: Got raw frame instead of tuple, using timestamp 0")
+                        else:
+                            logger.error(f"{self}: Unexpected frame_data format, skipping")
+                            continue
 
                     # Set initial timing on first frame
                     if next_frame_time is None:
@@ -890,9 +906,11 @@ class DittoTalkingHeadService(FrameProcessor):
                     frames_pushed += 1
 
                     if frames_pushed == 1:
-                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
+                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY! (timestamp: {audio_timestamp:.3f}s)")
                     elif frames_pushed % 10 == 0:
                         logger.info(f"{self}: Pushed {frames_pushed} video frames to Daily")
+                    elif frames_pushed <= 5:
+                        logger.info(f"{self}: Pushed frame {frames_pushed} (timestamp: {audio_timestamp:.3f}s)")
 
                     # Drift correction: Check if we're drifting from audio timeline
                     # expected_time = playback_start + (frames * frame_interval)
