@@ -356,43 +356,11 @@ class DittoTalkingHeadService(FrameProcessor):
                     self._event_id = None
                     self._audio_buffer.clear()
 
-                    # Wait for Ditto to finish generating video frames
-                    logger.info(f"{self}: Waiting for video frame generation to complete...")
-
-                    # First, wait for at least one frame to be generated
-                    max_wait_first_frame = 3.0
-                    check_interval = 0.1
-                    waited = 0.0
-                    initial_timestamp = self._last_speech_frame_time
-
-                    logger.info(f"{self}: Waiting for first speech frame (current timestamp: {initial_timestamp})...")
-                    while waited < max_wait_first_frame:
-                        if self._last_speech_frame_time > initial_timestamp:
-                            logger.info(f"{self}: First speech frame generated at {self._last_speech_frame_time}")
-                            break
-                        await asyncio.sleep(check_interval)
-                        waited += check_interval
-
-                    if self._last_speech_frame_time <= initial_timestamp:
-                        logger.warning(f"{self}: No speech frames generated after {waited:.1f}s!")
-                    else:
-                        # Now wait for frame generation to stop (no frames for 0.5s)
-                        logger.info(f"{self}: Monitoring for end of frame generation...")
-                        max_wait_completion = 5.0
-                        waited = 0.0
-
-                        while waited < max_wait_completion:
-                            current_time = asyncio.get_event_loop().time()
-                            time_since_last_frame = current_time - self._last_speech_frame_time
-
-                            # If no frames for 0.5 seconds, video generation is done
-                            if time_since_last_frame > 0.5:
-                                logger.info(f"{self}: No speech frames for {time_since_last_frame:.2f}s - video generation complete")
-                                break
-
-                            logger.debug(f"{self}: Still generating frames (last frame {time_since_last_frame:.2f}s ago)")
-                            await asyncio.sleep(check_interval)
-                            waited += check_interval
+                    # Simple approach: Just wait a fixed time for Ditto to finish
+                    # Ditto processes asynchronously in background threads, and timing varies
+                    # based on utterance length and GPU load
+                    logger.info(f"{self}: Waiting 3 seconds for Ditto to complete video generation...")
+                    await asyncio.sleep(3.0)
 
                     logger.info(f"{self}: ===== SPEECH FINALIZED - Setting _is_speaking = False =====")
                     self._is_speaking = False
