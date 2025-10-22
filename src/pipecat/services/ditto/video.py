@@ -801,14 +801,20 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily.
+        """Consume video frames from queue and push to Daily at 20fps.
 
-        Pushes video frames as they arrive from Ditto generation.
-        Transport layer handles pacing and synchronization naturally.
+        Rate-limits video frames to exactly 20fps (50ms per frame) regardless of
+        when Ditto generates them. This ensures video plays at real-time speed
+        synchronized with audio.
+
+        Ditto generates frames asynchronously (may be slower than real-time due to GPU),
+        but we push them at the correct playback rate to match audio timing.
         """
-        logger.info(f"{self}: Video playback task started")
+        logger.info(f"{self}: Video playback task started (20fps rate limiting)")
 
         frames_pushed = 0
+        frame_interval = 1.0 / 20.0  # 50ms per frame at 20fps
+        next_frame_time = None
 
         try:
             while True:
@@ -822,6 +828,18 @@ class DittoTalkingHeadService(FrameProcessor):
                     if frame is None:
                         logger.info(f"{self}: Received None, stopping video playback")
                         break
+
+                    # Set initial timing on first frame
+                    if next_frame_time is None:
+                        next_frame_time = asyncio.get_event_loop().time()
+
+                    # Wait until it's time to push this frame (20fps pacing)
+                    current_time = asyncio.get_event_loop().time()
+                    wait_time = next_frame_time - current_time
+
+                    if wait_time > 0:
+                        logger.debug(f"{self}: Waiting {wait_time*1000:.1f}ms before pushing frame")
+                        await asyncio.sleep(wait_time)
 
                     frames_pushed += 1
 
@@ -837,10 +855,13 @@ class DittoTalkingHeadService(FrameProcessor):
                         format="RGB"
                     )
 
-                    # Push video frame to pipeline immediately
+                    # Push video frame to pipeline at 20fps
                     await self.push_frame(output_frame)
 
                     logger.debug(f"{self}: Pushed video frame {frames_pushed}")
+
+                    # Schedule next frame for 50ms later
+                    next_frame_time += frame_interval
 
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
