@@ -125,6 +125,12 @@ class DittoTalkingHeadService(FrameProcessor):
         self._is_speaking = False  # Track if currently generating speech frames
         self._last_speech_frame_time = 0  # Track when last speech frame was generated
 
+        # Audio buffering for synchronized playback with video
+        self._pending_audio_buffer = bytearray()  # Buffer of raw audio bytes waiting to be pushed
+        self._pending_audio_sample_rate = 16000  # Sample rate of pending audio
+        self._pending_audio_num_channels = 1  # Number of channels
+        self._audio_push_lock = asyncio.Lock()  # Lock for audio pushing
+
         # SDK access lock to prevent concurrent run_chunk calls
         self._sdk_lock = asyncio.Lock()
 
@@ -284,6 +290,7 @@ class DittoTalkingHeadService(FrameProcessor):
 
         self._audio_buffer = bytearray()
         self._audio_accumulator.clear()
+        self._pending_audio_buffer.clear()
         # Clear synced audio queue
         while not self._synced_audio_queue.empty():
             try:
@@ -401,6 +408,11 @@ class DittoTalkingHeadService(FrameProcessor):
             self._is_speaking = True  # Set speaking flag immediately when TTS starts
             self._audio_buffer.clear()
             self._audio_accumulator.clear()
+
+            # Clear pending audio buffer for synchronized playback
+            async with self._audio_push_lock:
+                self._pending_audio_buffer.clear()
+
             # Clear synced audio queue
             while not self._synced_audio_queue.empty():
                 try:
@@ -428,6 +440,11 @@ class DittoTalkingHeadService(FrameProcessor):
                 self._is_speaking = True
                 self._is_interrupting = False
                 self._audio_accumulator.clear()
+
+                # Clear pending audio buffer
+                async with self._audio_push_lock:
+                    self._pending_audio_buffer.clear()
+
                 # Clear synced audio queue
                 while not self._synced_audio_queue.empty():
                     try:
@@ -452,16 +469,14 @@ class DittoTalkingHeadService(FrameProcessor):
                 # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
 
-                # Wait briefly for video frames to start generating before pushing audio
-                # This helps keep audio and video synchronized
-                if self._video_frame_queue.qsize() < 3:
-                    logger.debug(f"{self}: Waiting for video frames to generate (queue size: {self._video_frame_queue.qsize()})")
-                    await asyncio.sleep(0.1)  # Small delay to let video catch up
-
-                # Push audio frame for smooth playback
-                logger.info(f"{self}: Pushing TTS audio frame ({len(frame.audio)} bytes)")
-                await self.push_frame(frame, direction)
-                return  # Don't push again at the end
+                # Buffer audio for synchronized playback with video
+                # Instead of pushing immediately, we'll push it proportionally as video frames are pushed
+                async with self._audio_push_lock:
+                    self._pending_audio_buffer.extend(frame.audio)
+                    self._pending_audio_sample_rate = frame.sample_rate
+                    self._pending_audio_num_channels = frame.num_channels
+                    logger.info(f"{self}: Buffered {len(frame.audio)} bytes of audio (total buffer: {len(self._pending_audio_buffer)} bytes)")
+                return  # Don't push audio now - will be pushed synchronized with video
 
         elif isinstance(frame, TTSStoppedFrame):
             # The timeout in _audio_task_handler will handle finalization
@@ -487,6 +502,10 @@ class DittoTalkingHeadService(FrameProcessor):
         self._is_interrupting = True
         self._audio_buffer.clear()
         self._audio_accumulator.clear()
+
+        # Clear pending audio buffer
+        async with self._audio_push_lock:
+            self._pending_audio_buffer.clear()
 
         # Clear synced audio queue
         while not self._synced_audio_queue.empty():
@@ -762,7 +781,11 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily."""
+        """Consume video frames from queue and push to Daily.
+
+        Also pushes audio synchronized with video frames to maintain proper sync.
+        Each video frame at 20fps = 50ms, so we push 800 samples (1600 bytes) per frame.
+        """
         logger.info(f"{self}: Video playback task started")
 
         frames_pushed = 0
@@ -786,6 +809,29 @@ class DittoTalkingHeadService(FrameProcessor):
                         logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
                     elif frames_pushed % 10 == 0:
                         logger.info(f"{self}: Pushed {frames_pushed} video frames to Daily")
+
+                    # Push synchronized audio with this video frame
+                    # Video at 20fps = 50ms per frame = 800 samples at 16kHz
+                    samples_per_frame = 800
+                    bytes_per_frame = samples_per_frame * 2  # 16-bit = 2 bytes per sample
+
+                    async with self._audio_push_lock:
+                        if len(self._pending_audio_buffer) >= bytes_per_frame:
+                            # Extract audio chunk for this video frame
+                            audio_chunk = bytes(self._pending_audio_buffer[:bytes_per_frame])
+                            self._pending_audio_buffer = self._pending_audio_buffer[bytes_per_frame:]
+
+                            # Create audio frame and push
+                            audio_frame = TTSAudioRawFrame(
+                                audio=audio_chunk,
+                                sample_rate=self._pending_audio_sample_rate,
+                                num_channels=self._pending_audio_num_channels
+                            )
+                            await self.push_frame(audio_frame)
+                            logger.debug(f"{self}: Pushed {bytes_per_frame} bytes of audio with video frame {frames_pushed} (buffer remaining: {len(self._pending_audio_buffer)} bytes)")
+                        elif len(self._pending_audio_buffer) > 0:
+                            # Push remaining audio if available
+                            logger.debug(f"{self}: Buffer has only {len(self._pending_audio_buffer)} bytes (< {bytes_per_frame}), waiting for more audio")
 
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
