@@ -390,6 +390,23 @@ class DittoTalkingHeadService(FrameProcessor):
             # Note: event_id will be set when first audio frame arrives
 
         elif isinstance(frame, TTSAudioRawFrame):
+            # Defensive: Set speaking flag if not already set (in case TTSStartedFrame was missed)
+            if not self._is_speaking:
+                logger.warning(f"{self}: ===== TTS AUDIO RECEIVED - Setting _is_speaking = True (fallback) =====")
+                self._is_speaking = True
+                self._is_interrupting = False
+
+                # Clear idle frames
+                cleared_count = 0
+                while not self._video_frame_queue.empty():
+                    try:
+                        self._video_frame_queue.get_nowait()
+                        cleared_count += 1
+                    except asyncio.QueueEmpty:
+                        break
+                if cleared_count > 0:
+                    logger.info(f"{self}: Cleared {cleared_count} queued idle frames (fallback)")
+
             if not self._initialized or self._is_interrupting:
                 pass
             else:
