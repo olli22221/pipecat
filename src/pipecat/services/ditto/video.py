@@ -91,6 +91,16 @@ class DittoTalkingHeadService(FrameProcessor):
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
         self._audio_queue = None  # Will be initialized when audio task is created
 
+        # Audio-to-video frame mapping for synchronization
+        # We need 1:1 correspondence between audio and video frames
+        # Video: 20fps = 50ms per frame
+        # Audio: Need to accumulate and re-chunk to 50ms portions
+        self._synced_audio_queue = asyncio.Queue()  # Queue of audio frames synchronized with video (50ms each)
+        self._audio_accumulator = bytearray()  # Accumulates raw audio bytes for re-chunking
+        self._audio_sample_rate = 16000  # Ditto uses 16kHz
+        self._video_frame_duration_ms = 50  # 20fps = 50ms per frame
+        self._samples_per_video_frame = int((self._audio_sample_rate * self._video_frame_duration_ms) / 1000)  # 800 samples
+
         # SDK and initialization state
         self._sdk = None
         self._initialized = False
@@ -273,6 +283,13 @@ class DittoTalkingHeadService(FrameProcessor):
             self._idle_frame_task = None
 
         self._audio_buffer = bytearray()
+        self._audio_accumulator.clear()
+        # Clear synced audio queue
+        while not self._synced_audio_queue.empty():
+            try:
+                self._synced_audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         self._sdk = None
         self._initialized = False
 
@@ -383,6 +400,13 @@ class DittoTalkingHeadService(FrameProcessor):
             self._is_interrupting = False
             self._is_speaking = True  # Set speaking flag immediately when TTS starts
             self._audio_buffer.clear()
+            self._audio_accumulator.clear()
+            # Clear synced audio queue
+            while not self._synced_audio_queue.empty():
+                try:
+                    self._synced_audio_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
             # Clear any queued idle frames to prevent them from playing during speech
             cleared_count = 0
@@ -403,6 +427,13 @@ class DittoTalkingHeadService(FrameProcessor):
                 logger.warning(f"{self}: ===== TTS AUDIO RECEIVED - Setting _is_speaking = True (fallback) =====")
                 self._is_speaking = True
                 self._is_interrupting = False
+                self._audio_accumulator.clear()
+                # Clear synced audio queue
+                while not self._synced_audio_queue.empty():
+                    try:
+                        self._synced_audio_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
                 # Clear idle frames
                 cleared_count = 0
@@ -418,14 +449,37 @@ class DittoTalkingHeadService(FrameProcessor):
             if not self._initialized or self._is_interrupting:
                 pass
             else:
+                # Resample audio to 16kHz for synchronization
+                audio_resampled = await self._resampler.resample(
+                    frame.audio, frame.sample_rate, self._audio_sample_rate
+                )
+
+                # Add to accumulator for re-chunking into 50ms video-aligned portions
+                self._audio_accumulator.extend(audio_resampled)
+                logger.debug(f"{self}: Added {len(audio_resampled)} bytes to accumulator, total: {len(self._audio_accumulator)} bytes")
+
+                # Create 50ms audio chunks (800 samples at 16kHz = 1600 bytes) to match video frame rate
+                chunk_size_bytes = self._samples_per_video_frame * 2  # int16 = 2 bytes per sample
+                while len(self._audio_accumulator) >= chunk_size_bytes:
+                    # Extract one 50ms audio chunk
+                    audio_chunk_bytes = bytes(self._audio_accumulator[:chunk_size_bytes])
+                    self._audio_accumulator = self._audio_accumulator[chunk_size_bytes:]
+
+                    # Create TTSAudioRawFrame for this 50ms chunk (matches one video frame)
+                    synced_frame = TTSAudioRawFrame(
+                        audio=audio_chunk_bytes,
+                        sample_rate=self._audio_sample_rate,
+                        num_channels=1,
+                        id=frame.id  # Preserve original ID
+                    )
+
+                    # Queue for synchronized playback with video
+                    await self._synced_audio_queue.put(synced_frame)
+                    logger.debug(f"{self}: Created synced 50ms audio frame, queue size: {self._synced_audio_queue.qsize()}")
+
                 # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
-
-                # Push audio frame immediately for smooth playback
-                # Video frames will follow as they're generated
-                logger.info(f"{self}: Pushing complete TTS audio frame ({len(frame.audio)} bytes) for smooth playback")
-                await self.push_frame(frame, direction)
-                return  # Don't push again at the end
+                return  # Don't push audio independently - it will be synchronized with video
 
         elif isinstance(frame, TTSStoppedFrame):
             # The timeout in _audio_task_handler will handle finalization
@@ -450,6 +504,15 @@ class DittoTalkingHeadService(FrameProcessor):
         """Handle user interruption by stopping audio processing and restarting."""
         self._is_interrupting = True
         self._audio_buffer.clear()
+        self._audio_accumulator.clear()
+
+        # Clear synced audio queue
+        while not self._synced_audio_queue.empty():
+            try:
+                self._synced_audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
         self._event_id = None
 
         # Cancel and restart audio task
@@ -716,21 +779,26 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily."""
-        logger.info(f"{self}: Video playback task started")
+        """Consume video frames from queue and push synchronized 1:1 with audio to Daily.
+
+        For each video frame, pushes exactly one 50ms audio chunk to ensure perfect sync.
+        Audio has been pre-chunked to 50ms portions to match video frame rate (20fps).
+        """
+        logger.info(f"{self}: Video playback task started (with 1:1 audio-video sync)")
 
         frames_pushed = 0
+        audio_frames_pushed = 0
 
         try:
             while True:
                 try:
-                    # Get frame from the queue (with timeout to check for cancellation)
-                    frame = await asyncio.wait_for(
+                    # Get video frame from the queue (with timeout to check for cancellation)
+                    video_frame = await asyncio.wait_for(
                         self._video_frame_queue.get(),
                         timeout=0.1
                     )
 
-                    if frame is None:
+                    if video_frame is None:
                         logger.info(f"{self}: Received None, stopping video playback")
                         break
 
@@ -741,10 +809,24 @@ class DittoTalkingHeadService(FrameProcessor):
                     elif frames_pushed % 10 == 0:
                         logger.info(f"{self}: Pushed {frames_pushed} video frames to Daily")
 
+                    # For speech frames, push exactly one 50ms audio chunk with each video frame
+                    # This ensures 1:1 correspondence
+                    if self._is_speaking and not self._synced_audio_queue.empty():
+                        try:
+                            # Get one 50ms audio chunk (matches this video frame's duration)
+                            audio_frame = self._synced_audio_queue.get_nowait()
+
+                            # Push audio frame BEFORE video frame for synchronization
+                            await self.push_frame(audio_frame)
+                            audio_frames_pushed += 1
+                            logger.info(f"{self}: 🔊 Pushed 1:1 synced audio frame ({len(audio_frame.audio)} bytes, 50ms) with video #{frames_pushed}")
+                        except asyncio.QueueEmpty:
+                            logger.warning(f"{self}: ⚠️ No synced audio available for video frame {frames_pushed}")
+
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
-                        image=frame,
-                        size=(frame.shape[1], frame.shape[0]),  # (width, height)
+                        image=video_frame,
+                        size=(video_frame.shape[1], video_frame.shape[0]),  # (width, height)
                         format="RGB"
                     )
 
@@ -768,4 +850,4 @@ class DittoTalkingHeadService(FrameProcessor):
             import traceback
             traceback.print_exc()
         finally:
-            logger.info(f"{self}: Video playback finished (pushed {frames_pushed} frames)")
+            logger.info(f"{self}: Video playback finished (pushed {frames_pushed} video frames, {audio_frames_pushed} audio frames in 1:1 sync)")
