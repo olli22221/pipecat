@@ -521,9 +521,10 @@ class DittoTalkingHeadService(FrameProcessor):
         was_speaking = False  # Track state changes for logging
 
         try:
-            # Calculate frame interval for target FPS
-            frame_interval = 1.0 / self._target_fps  # seconds between frames
-            ditto_native_fps = 20  # Ditto's native output FPS
+            # Each audio chunk is 6480 samples at 16kHz = 0.405 seconds
+            # At 20fps, this generates ~8 frames
+            # So we should feed one chunk every 0.4 seconds for natural 20fps playback
+            chunk_duration = 6480 / 16000  # 0.405 seconds
 
             while True:
                 start_time = asyncio.get_event_loop().time()
@@ -547,11 +548,11 @@ class DittoTalkingHeadService(FrameProcessor):
                     # Don't generate more idle frames if queue is getting too full
                     # This prevents idle frames from building up and playing during speech
                     queue_size = self._video_frame_queue.qsize()
-                    if queue_size > 30:  # ~1 second at 30fps
-                        logger.debug(f"{self}: Video queue is full ({queue_size} frames), skipping idle generation")
-                        # Sleep to maintain timing
+                    if queue_size > 20:  # Don't let queue get too full
+                        logger.debug(f"{self}: Video queue has {queue_size} frames, skipping idle generation")
+                        # Sleep for chunk duration to maintain timing
                         elapsed = asyncio.get_event_loop().time() - start_time
-                        sleep_time = max(0, frame_interval * (ditto_native_fps / self._target_fps) - elapsed)
+                        sleep_time = max(0, chunk_duration - elapsed)
                         await asyncio.sleep(sleep_time)
                         continue
 
@@ -600,10 +601,10 @@ class DittoTalkingHeadService(FrameProcessor):
                         logger.info(f"{self}: ===== IDLE mode paused - bot is speaking (_is_speaking = {self._is_speaking}) =====")
                         was_speaking = True
 
-                # Sleep to maintain frame rate
-                # Note: Ditto generates multiple frames per chunk, so we feed chunks less frequently
+                # Sleep for the duration of the audio chunk to maintain natural timing
+                # Each chunk represents 0.405s of audio, generating ~8 frames at 20fps
                 elapsed = asyncio.get_event_loop().time() - start_time
-                sleep_time = max(0, frame_interval * (ditto_native_fps / self._target_fps) - elapsed)
+                sleep_time = max(0, chunk_duration - elapsed)
                 await asyncio.sleep(sleep_time)
 
         except asyncio.CancelledError:
