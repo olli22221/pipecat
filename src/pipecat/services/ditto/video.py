@@ -426,9 +426,11 @@ class DittoTalkingHeadService(FrameProcessor):
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self.stop(frame)
 
-        # Call parent class to handle frame routing through the pipeline
-        # This ensures frames are properly passed downstream
+        # Call parent class to handle system frames and observers
         await super().process_frame(frame, direction)
+
+        # Push frame downstream to continue pipeline (audio to Daily, etc.)
+        await self.push_frame(frame, direction)
 
     async def _handle_interruption(self):
         """Handle user interruption by stopping audio processing and restarting."""
