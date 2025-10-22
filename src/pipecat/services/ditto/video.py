@@ -514,6 +514,10 @@ class DittoTalkingHeadService(FrameProcessor):
 
         self._event_id = None
 
+        # Reset speaking flag so idle frames can resume
+        logger.info(f"{self}: ===== INTERRUPTION - Setting _is_speaking = False =====")
+        self._is_speaking = False
+
         # Cancel and restart audio task
         await self._cancel_audio_task()
         self._is_interrupting = False
