@@ -469,8 +469,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     synced_frame = TTSAudioRawFrame(
                         audio=audio_chunk_bytes,
                         sample_rate=self._audio_sample_rate,
-                        num_channels=1,
-                        id=frame.id  # Preserve original ID
+                        num_channels=1
                     )
 
                     # Queue for synchronized playback with video
