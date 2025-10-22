@@ -488,14 +488,27 @@ class DittoTalkingHeadService(FrameProcessor):
                 # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
 
-                # Buffer audio for synchronized playback with video
-                # Instead of pushing immediately, we'll push it proportionally as video frames are pushed
-                async with self._audio_push_lock:
-                    self._pending_audio_buffer.extend(frame.audio)
-                    self._pending_audio_sample_rate = frame.sample_rate
-                    self._pending_audio_num_channels = frame.num_channels
-                    logger.info(f"{self}: Buffered {len(frame.audio)} bytes of audio (total buffer: {len(self._pending_audio_buffer)} bytes)")
-                return  # Don't push audio now - will be pushed synchronized with video
+                # Push audio immediately with timestamp
+                # WebRTC will use timestamps to synchronize with video
+                # Set base timestamp on first audio frame
+                if self._base_timestamp is None:
+                    self._base_timestamp = asyncio.get_event_loop().time()
+                    logger.info(f"{self}: Base timestamp set: {self._base_timestamp}")
+
+                # Calculate timestamp for this audio chunk
+                audio_timestamp = self._base_timestamp + (self._audio_samples_pushed / frame.sample_rate)
+
+                # Add timestamp metadata if the frame supports it
+                if hasattr(frame, 'pts'):
+                    frame.pts = audio_timestamp
+
+                # Update samples counter
+                num_samples = len(frame.audio) // 2  # 16-bit = 2 bytes per sample
+                self._audio_samples_pushed += num_samples
+
+                logger.info(f"{self}: Pushing TTS audio ({len(frame.audio)} bytes, {num_samples} samples, timestamp: {audio_timestamp:.3f}s)")
+                await self.push_frame(frame, direction)
+                return  # Don't push again at the end
 
         elif isinstance(frame, TTSStoppedFrame):
             # The timeout in _audio_task_handler will handle finalization
@@ -805,16 +818,15 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily.
+        """Consume video frames from queue and push to Daily with timestamps.
 
-        Also pushes audio synchronized with video frames to maintain proper sync.
-        Implements 200ms audio buffering before starting playback for smoother lip-sync.
-        Each video frame at 20fps = 50ms, so we push 800 samples (1600 bytes) per frame.
+        Video frames are pushed with timestamps for WebRTC synchronization.
+        Audio is pushed separately (in TTSAudioRawFrame processing) with matching timestamps.
+        WebRTC transport uses timestamps to maintain perfect audio-video sync.
         """
         logger.info(f"{self}: Video playback task started")
 
         frames_pushed = 0
-        audio_buffering_started = False
 
         try:
             while True:
@@ -836,56 +848,14 @@ class DittoTalkingHeadService(FrameProcessor):
                     elif frames_pushed % 10 == 0:
                         logger.info(f"{self}: Pushed {frames_pushed} video frames to Daily")
 
-                    # Set base timestamp on first frame
-                    if self._base_timestamp is None:
-                        self._base_timestamp = asyncio.get_event_loop().time()
-                        logger.info(f"{self}: Base timestamp set: {self._base_timestamp}")
-
-                    # Push synchronized audio with this video frame
-                    # Video at 20fps = 50ms per frame = 800 samples at 16kHz
-                    samples_per_frame = 800
-                    bytes_per_frame = samples_per_frame * 2  # 16-bit = 2 bytes per sample
-
-                    async with self._audio_push_lock:
-                        # Wait for 200ms buffer before starting to push audio
-                        if not audio_buffering_started and len(self._pending_audio_buffer) >= self._audio_buffer_threshold_bytes:
-                            audio_buffering_started = True
-                            logger.info(f"{self}: 200ms audio buffer filled ({len(self._pending_audio_buffer)} bytes), starting audio playback")
-
-                        # Only push audio after buffering threshold is reached
-                        if audio_buffering_started and len(self._pending_audio_buffer) >= bytes_per_frame:
-                            # Extract audio chunk for this video frame
-                            audio_chunk = bytes(self._pending_audio_buffer[:bytes_per_frame])
-                            self._pending_audio_buffer = self._pending_audio_buffer[bytes_per_frame:]
-
-                            # Calculate timestamp for this audio chunk
-                            # timestamp = base + (samples_pushed / sample_rate)
-                            audio_timestamp = self._base_timestamp + (self._audio_samples_pushed / self._pending_audio_sample_rate)
-
-                            # Create audio frame with timestamp
-                            audio_frame = TTSAudioRawFrame(
-                                audio=audio_chunk,
-                                sample_rate=self._pending_audio_sample_rate,
-                                num_channels=self._pending_audio_num_channels
-                            )
-
-                            # Add timestamp metadata if the frame supports it
-                            if hasattr(audio_frame, 'pts'):
-                                audio_frame.pts = audio_timestamp
-
-                            await self.push_frame(audio_frame)
-
-                            # Update audio samples counter
-                            self._audio_samples_pushed += samples_per_frame
-
-                            logger.debug(f"{self}: Pushed {bytes_per_frame} bytes of audio (timestamp: {audio_timestamp:.3f}s, buffer remaining: {len(self._pending_audio_buffer)} bytes)")
-                        elif len(self._pending_audio_buffer) > 0:
-                            # Still buffering
-                            logger.debug(f"{self}: Buffering audio: {len(self._pending_audio_buffer)}/{self._audio_buffer_threshold_bytes} bytes")
-
                     # Calculate timestamp for this video frame
                     # timestamp = base + (frames_pushed / fps)
-                    video_timestamp = self._base_timestamp + (self._video_frames_pushed / 20.0)  # 20fps
+                    # Note: base_timestamp set when first audio arrives
+                    if self._base_timestamp is not None:
+                        video_timestamp = self._base_timestamp + (self._video_frames_pushed / 20.0)  # 20fps
+                    else:
+                        # Fallback if no audio yet
+                        video_timestamp = asyncio.get_event_loop().time()
 
                     # Create OutputImageRawFrame for Daily with timestamp
                     output_frame = OutputImageRawFrame(
