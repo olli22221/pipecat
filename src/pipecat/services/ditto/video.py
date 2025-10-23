@@ -58,7 +58,7 @@ class DittoTalkingHeadService(FrameProcessor):
         cfg_pkl: Path to Ditto config file (use online config like v0.4_hubert_cfg_pytorch_online.pkl)
         source_image_path: Path to the source image (the avatar face to animate)
         chunk_size: Audio chunk size tuple (history, current, future) frames
-                   - Default (3, 5, 2) = ~200ms latency, 50% overlap
+                   - Default (1, 3, 1) = ~100ms latency for high FPS
         save_frames_dir: Optional directory path to save generated frames as PNG files
         target_fps: Target frame rate for idle frame generation (default: 30 fps)
                    - Ensures smooth video even during silence
@@ -72,7 +72,7 @@ class DittoTalkingHeadService(FrameProcessor):
         data_root: str,
         cfg_pkl: str,
         source_image_path: str,
-        chunk_size: tuple = (3, 5, 2),
+        chunk_size: tuple = (1, 3, 1),
         save_frames_dir: Optional[str] = None,
         target_fps: int = 30,
         **kwargs
@@ -372,7 +372,8 @@ class DittoTalkingHeadService(FrameProcessor):
                     self._audio_buffer.extend(audio_resampled)
 
                     # Process chunks as they accumulate
-                    chunk_size_bytes = 6480 * 2  # 6480 samples * 2 bytes per sample
+                    # Smaller chunks = faster throughput closer to 125fps capability
+                    chunk_size_bytes = 3240 * 2  # 3240 samples (~200ms) * 2 bytes per sample
                     while len(self._audio_buffer) >= chunk_size_bytes:
                         chunk_bytes = bytes(self._audio_buffer[:chunk_size_bytes])
                         self._audio_buffer = self._audio_buffer[chunk_size_bytes:]
@@ -583,9 +584,9 @@ class DittoTalkingHeadService(FrameProcessor):
 
         try:
             # Feed silent audio chunks at their natural rate
-            # Each chunk is 6480 samples at 16kHz = 405ms duration
+            # Each chunk is 3240 samples at 16kHz = 202.5ms duration
             # This matches the timing of speech audio chunks for consistent frame generation
-            chunk_duration = 6480 / 16000.0  # 0.405 seconds
+            chunk_duration = 3240 / 16000.0  # 0.2025 seconds
             chunk_interval = chunk_duration  # Feed at natural audio rate
 
             while True:
@@ -620,7 +621,7 @@ class DittoTalkingHeadService(FrameProcessor):
 
                     # Generate neutral frame by feeding silent audio to Ditto
                     # This ensures continuous frame generation during silence
-                    silent_audio = np.zeros(6480, dtype=np.float32)
+                    silent_audio = np.zeros(3240, dtype=np.float32)
 
                     # Add history padding for proper SDK processing
                     if len(self._audio_history) >= 1920:
@@ -733,7 +734,7 @@ class DittoTalkingHeadService(FrameProcessor):
         logger.info(f"{self}: After padding, buffer has {num_samples_padded} samples")
 
         # Process remaining chunks
-        chunk_size_bytes = 6480 * 2  # 6480 samples * 2 bytes per sample
+        chunk_size_bytes = 3240 * 2  # 3240 samples * 2 bytes per sample
         iteration = 0
 
         while len(self._audio_buffer) >= chunk_size_bytes:
@@ -760,8 +761,8 @@ class DittoTalkingHeadService(FrameProcessor):
             chunk_float = chunk_array.astype(np.float32) / 32768.0
 
             # Pad to minimum size if needed
-            if len(chunk_float) < 6480:
-                padding_needed = 6480 - len(chunk_float)
+            if len(chunk_float) < 3240:
+                padding_needed = 3240 - len(chunk_float)
                 final_padding = np.full(padding_needed, chunk_float[-1], dtype=np.float32)
                 chunk_float = np.concatenate([chunk_float, final_padding])
 
@@ -805,7 +806,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     self._last_frame = frame.copy()
 
                     # Tag frame with current audio chunk timestamp for A/V sync
-                    # Each 6480-sample chunk (~405ms) generates ~8 video frames
+                    # Each 3240-sample chunk (~202ms) generates ~4 video frames at 20fps
                     # Frames inherit the timestamp of the audio chunk that generated them
                     frame_with_timestamp = (frame, self._current_audio_chunk_timestamp)
 
