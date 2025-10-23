@@ -499,23 +499,15 @@ class DittoTalkingHeadService(FrameProcessor):
                 # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
 
-                # Buffer audio for synchronized playback with video
-                # Don't push immediately - let _consume_and_push_video handle it
-                async with self._audio_push_lock:
-                    self._pending_audio_buffer.extend(frame.audio)
-                    self._pending_audio_sample_rate = frame.sample_rate
-                    self._pending_audio_num_channels = frame.num_channels
-                    logger.info(f"{self}: Buffered TTS audio ({len(frame.audio)} bytes, total buffered: {len(self._pending_audio_buffer)} bytes)")
+                # Push audio immediately - let transport handle pacing
+                logger.info(f"{self}: Pushing TTS audio ({len(frame.audio)} bytes)")
+                await self.push_frame(frame, direction)
 
-                # Track audio duration for timestamp calculation
-                # Calculate duration of this audio chunk and add to our running total
-                num_samples = len(frame.audio) // (2 * frame.num_channels)  # 16-bit = 2 bytes per sample
-                audio_duration_sec = num_samples / frame.sample_rate
-                # Convert to 16kHz samples for timestamp tracking (since Ditto uses 16kHz)
-                equivalent_16khz_samples = int(audio_duration_sec * 16000)
-                self._audio_samples_pushed += equivalent_16khz_samples
+                # Update audio sample counter for timestamp tracking
+                num_samples = len(frame.audio) // 2  # 16-bit = 2 bytes per sample
+                self._audio_samples_pushed += num_samples
 
-                return  # Don't push the frame downstream
+                return  # Don't push again at the end
 
         elif isinstance(frame, TTSStoppedFrame):
             # The timeout in _audio_task_handler will handle finalization
@@ -860,14 +852,10 @@ class DittoTalkingHeadService(FrameProcessor):
 
         Video frames are tagged with the timestamp of the audio chunk that generated them.
         Playback is paced at 20fps while respecting timestamp ordering for A/V sync.
-
-        Audio is pushed synchronized with video - each video frame triggers pushing
-        the corresponding audio chunk to maintain perfect A/V sync.
         """
         logger.info(f"{self}: Video playback task started (timestamp-based sync with drift correction)")
 
         frames_pushed = 0
-        audio_chunks_pushed = 0
         frame_interval = 1.0 / 20.0  # 50ms per frame at 20fps
         next_frame_time = None
         playback_start_time = None
@@ -915,41 +903,6 @@ class DittoTalkingHeadService(FrameProcessor):
                     if wait_time > 0:
                         logger.debug(f"{self}: Waiting {wait_time*1000:.1f}ms before pushing frame")
                         await asyncio.sleep(wait_time)
-
-                    # Push audio chunk synchronized with video frame
-                    # Each video frame (50ms at 20fps) needs a corresponding audio chunk
-                    async with self._audio_push_lock:
-                        if len(self._pending_audio_buffer) > 0:
-                            # Calculate how many bytes we need for 50ms of audio
-                            # bytes_per_sample = 2 (16-bit audio)
-                            # samples_for_50ms = (sample_rate * 50) / 1000
-                            # bytes_for_50ms = samples_for_50ms * bytes_per_sample * num_channels
-                            bytes_per_sample = 2
-                            samples_for_frame = int((self._pending_audio_sample_rate * frame_interval * 1000) / 1000)
-                            bytes_for_frame = samples_for_frame * bytes_per_sample * self._pending_audio_num_channels
-
-                            # Extract audio chunk (or whatever is available if less than needed)
-                            audio_chunk_size = min(bytes_for_frame, len(self._pending_audio_buffer))
-                            audio_chunk = bytes(self._pending_audio_buffer[:audio_chunk_size])
-                            self._pending_audio_buffer = self._pending_audio_buffer[audio_chunk_size:]
-
-                            # Create and push audio frame
-                            if len(audio_chunk) > 0:
-                                from pipecat.frames.frames import TTSAudioRawFrame
-                                audio_frame = TTSAudioRawFrame(
-                                    audio=audio_chunk,
-                                    sample_rate=self._pending_audio_sample_rate,
-                                    num_channels=self._pending_audio_num_channels
-                                )
-                                await self.push_frame(audio_frame)
-                                audio_chunks_pushed += 1
-
-                                if audio_chunks_pushed == 1:
-                                    logger.info(f"{self}: 🔊 FIRST AUDIO CHUNK PUSHED! ({len(audio_chunk)} bytes)")
-                                elif audio_chunks_pushed % 10 == 0:
-                                    logger.info(f"{self}: Pushed {audio_chunks_pushed} audio chunks ({len(self._pending_audio_buffer)} bytes remaining)")
-                                else:
-                                    logger.debug(f"{self}: Pushed audio chunk {audio_chunks_pushed} ({len(audio_chunk)} bytes, {len(self._pending_audio_buffer)} remaining)")
 
                     frames_pushed += 1
 
@@ -1007,4 +960,4 @@ class DittoTalkingHeadService(FrameProcessor):
             import traceback
             traceback.print_exc()
         finally:
-            logger.info(f"{self}: Video playback finished (pushed {frames_pushed} frames, {audio_chunks_pushed} audio chunks)")
+            logger.info(f"{self}: Video playback finished (pushed {frames_pushed} frames)")
