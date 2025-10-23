@@ -846,18 +846,16 @@ class DittoTalkingHeadService(FrameProcessor):
     async def _consume_and_push_video(self):
         """Consume video frames from queue and push with audio-derived timestamps.
 
-        Uses timestamps from audio chunks to pace video frames, ensuring perfect
-        synchronization even over long utterances. Implements drift correction
-        by comparing expected vs actual playback timing.
+        Pushes video frames as soon as they're available from Ditto, with timestamps
+        from the audio chunks that generated them. The transport layer (Daily) handles
+        synchronization using these timestamps, ensuring perfect A/V sync.
 
-        Video frames are tagged with the timestamp of the audio chunk that generated them.
-        Playback is paced at 20fps while respecting timestamp ordering for A/V sync.
+        No artificial pacing delays - frames are pushed immediately to minimize latency.
         """
         logger.info(f"{self}: Video playback task started (timestamp-based sync with drift correction)")
 
         frames_pushed = 0
-        frame_interval = 1.0 / 20.0  # 50ms per frame at 20fps
-        next_frame_time = None
+        frame_interval = 1.0 / 20.0  # 50ms per frame at 20fps (for drift calculation only)
         playback_start_time = None
         last_logged_drift = 0
 
@@ -889,21 +887,13 @@ class DittoTalkingHeadService(FrameProcessor):
                             logger.error(f"{self}: Unexpected frame_data format, skipping")
                             continue
 
-                    # Set initial timing on first frame
-                    if next_frame_time is None:
-                        current_time = asyncio.get_event_loop().time()
-                        next_frame_time = current_time
-                        playback_start_time = current_time
+                    # Set initial timing on first frame for drift tracking
+                    if playback_start_time is None:
+                        playback_start_time = asyncio.get_event_loop().time()
                         logger.info(f"{self}: Starting video playback at {playback_start_time:.3f}s")
 
-                    # Wait until it's time to push this frame (20fps pacing)
-                    current_time = asyncio.get_event_loop().time()
-                    wait_time = next_frame_time - current_time
-
-                    if wait_time > 0:
-                        logger.debug(f"{self}: Waiting {wait_time*1000:.1f}ms before pushing frame")
-                        await asyncio.sleep(wait_time)
-
+                    # Push frames as soon as they're available - no artificial pacing delay
+                    # The timestamps will handle synchronization at the transport layer
                     frames_pushed += 1
 
                     if frames_pushed == 1:
@@ -936,13 +926,10 @@ class DittoTalkingHeadService(FrameProcessor):
                     if hasattr(output_frame, 'pts'):
                         output_frame.pts = audio_timestamp
 
-                    # Push video frame to pipeline at 20fps
+                    # Push video frame immediately with timestamp for transport-level sync
                     await self.push_frame(output_frame)
 
                     logger.debug(f"{self}: Pushed video frame {frames_pushed} (audio_ts: {audio_timestamp:.3f}s)")
-
-                    # Schedule next frame for 50ms later
-                    next_frame_time += frame_interval
 
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
