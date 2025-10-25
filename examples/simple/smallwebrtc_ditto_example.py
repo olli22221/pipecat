@@ -294,7 +294,7 @@ if __name__ == "__main__":
         "--host", default="localhost", help="Host for HTTP server (default: localhost)"
     )
     parser.add_argument(
-        "--port", type=int, default=7860, help="Port for HTTP server (default: 7860)"
+        "--port", type=int, default=8080, help="Port for HTTP server (default: 7860)"
     )
     args = parser.parse_args()
 
