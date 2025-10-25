@@ -97,8 +97,6 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 load_dotenv(override=True)
 
-app = FastAPI()
-
 # Store connections by pc_id
 pcs_map: Dict[str, SmallWebRTCConnection] = {}
 
@@ -108,9 +106,6 @@ ice_servers = [
         urls="stun:stun.l.google.com:19302",
     )
 ]
-
-# Mount the frontend at /client
-app.mount("/client", SmallWebRTCPrebuiltUI)
 
 
 async def run_ditto_bot(webrtc_connection: SmallWebRTCConnection):
@@ -285,7 +280,11 @@ async def lifespan(app: FastAPI):
     pcs_map.clear()
 
 
-app.router.lifespan_context = lifespan
+# Create FastAPI app with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# Mount the frontend at /client
+app.mount("/client", SmallWebRTCPrebuiltUI)
 
 
 if __name__ == "__main__":
