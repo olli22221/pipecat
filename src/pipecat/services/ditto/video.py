@@ -618,11 +618,6 @@ class DittoTalkingHeadService(FrameProcessor):
                     elif frames_pushed % 10 == 0:
                         logger.info(f"{self}: Pushed {frames_pushed} frames to Daily")
 
-                    # Push corresponding audio frames first (they need to go before video)
-                    for audio_frame in audio_frames:
-                        await self.push_frame(audio_frame)
-                        logger.debug(f"{self}: Pushed audio frame with video frame {frames_pushed}")
-
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
                         image=frame,
@@ -637,9 +632,14 @@ class DittoTalkingHeadService(FrameProcessor):
                         output_frame.pts = frame_pts_ns
                         logger.debug(f"{self}: Frame PTS={frame_pts_ns}ns (offset={frame_time_offset_s:.3f}s)")
 
-                    # Push video frame
+                    # Push video frame FIRST to give it a head start (video is ~8MB, audio is ~KB)
                     await self.push_frame(output_frame)
                     logger.debug(f"{self}: Pushed video frame {frames_pushed} to Daily")
+
+                    # Push corresponding audio frames AFTER video (audio will catch up due to smaller size)
+                    for audio_frame in audio_frames:
+                        await self.push_frame(audio_frame)
+                        logger.debug(f"{self}: Pushed audio frame with video frame {frames_pushed}")
 
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
