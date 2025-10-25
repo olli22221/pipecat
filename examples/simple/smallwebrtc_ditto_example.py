@@ -149,6 +149,7 @@ async def run_ditto_bot(webrtc_connection: SmallWebRTCConnection):
 
     # Create SmallWebRTC transport with video enabled
     # SmallWebRTC has built-in timing synchronization for proper AV sync!
+    # Using smaller video dimensions for better WebRTC compatibility
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
@@ -156,8 +157,8 @@ async def run_ditto_bot(webrtc_connection: SmallWebRTCConnection):
             audio_out_enabled=True,
             audio_out_sample_rate=24000,  # Match Higgs TTS output
             video_out_enabled=True,  # Enable video output for Ditto
-            video_out_width=1440,  # Match Ditto's output size
-            video_out_height=1920,  # Match Ditto's output size
+            video_out_width=720,  # Reduced from 1440 for better compatibility
+            video_out_height=960,  # Reduced from 1920 for better compatibility
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(),
         ),
