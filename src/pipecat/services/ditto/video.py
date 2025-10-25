@@ -8,6 +8,7 @@ import asyncio
 import math
 import os
 import queue as queue_module
+import time
 from typing import Optional
 
 import numpy as np
@@ -98,6 +99,12 @@ class DittoTalkingHeadService(FrameProcessor):
         self._event_id = None  # Track current utterance
         self._is_interrupting = False  # Interrupt flag
         self._resampler = create_stream_resampler()  # Audio resampler
+
+        # Timing and synchronization
+        self._audio_start_time = None  # When audio processing started
+        self._audio_samples_processed = 0  # Total audio samples processed (at 16kHz)
+        self._video_frame_count = 0  # Total video frames generated
+        self._target_fps = 25  # Target frame rate
         
         # Frame reading/playback state
         self._frame_reader_running = False
@@ -342,6 +349,10 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Starting new TTS utterance")
             self._is_interrupting = False
             self._audio_buffer.clear()
+            # Reset timing tracking
+            self._audio_start_time = time.time()
+            self._audio_samples_processed = 0
+            self._video_frame_count = 0
             # Note: event_id will be set when first audio frame arrives
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -369,6 +380,11 @@ class DittoTalkingHeadService(FrameProcessor):
         self._is_interrupting = True
         self._audio_buffer.clear()
         self._event_id = None
+
+        # Reset timing
+        self._audio_start_time = None
+        self._audio_samples_processed = 0
+        self._video_frame_count = 0
 
         # Cancel and restart audio task
         await self._cancel_audio_task()
@@ -404,6 +420,9 @@ class DittoTalkingHeadService(FrameProcessor):
 
         # Update history for next chunk
         self._audio_history = audio_chunk
+
+        # Track audio samples processed (for timestamp calculation)
+        self._audio_samples_processed += len(audio_chunk)
 
     async def _finalize_audio(self):
         """Process any remaining audio in the buffer after TTS stops."""
@@ -468,9 +487,9 @@ class DittoTalkingHeadService(FrameProcessor):
         logger.info(f"{self}: Finalization complete")
 
     async def _read_frames_from_sdk(self):
-        """Read frames from SDK's capture queue and add to video playback queue."""
+        """Read frames from SDK's capture queue and add to video playback queue with PTS."""
         logger.info(f"{self}: Frame reader task started - reading from capture queue")
-        
+
         frames_read = 0
         try:
             while self._frame_reader_running:
@@ -480,22 +499,33 @@ class DittoTalkingHeadService(FrameProcessor):
                         None,
                         lambda: self._frame_capture_queue.get(timeout=0.1)
                     )
-                    
+
                     if frame is None:
                         logger.info(f"{self}: Received None from capture queue, stopping reader")
                         break
-                    
+
+                    # Calculate PTS for this frame
+                    # PTS = frame_number / fps (in seconds)
+                    frame_pts = self._video_frame_count / self._target_fps
+
+                    # Also calculate expected timestamp relative to audio start
+                    if self._audio_start_time is not None:
+                        expected_timestamp = self._audio_start_time + frame_pts
+                    else:
+                        expected_timestamp = time.time()
+
                     frames_read += 1
-                    
+                    self._video_frame_count += 1
+
                     if frames_read == 1:
-                        logger.info(f"{self}: 🎉 FIRST FRAME CAPTURED!")
+                        logger.info(f"{self}: 🎉 FIRST FRAME CAPTURED! PTS={frame_pts:.3f}s")
                     elif frames_read % 10 == 0:
-                        logger.info(f"{self}: Read {frames_read} frames from SDK")
-                    
-                    # Add to video playback queue
-                    await self._video_frame_queue.put(frame)
+                        logger.info(f"{self}: Read {frames_read} frames from SDK (PTS={frame_pts:.3f}s)")
+
+                    # Add to video playback queue with timing info
+                    await self._video_frame_queue.put((frame, frame_pts, expected_timestamp))
                     logger.debug(f"{self}: Added frame to video queue (qsize={self._video_frame_queue.qsize()})")
-                    
+
                 except queue_module.Empty:
                     await asyncio.sleep(0.01)
                     continue
@@ -504,7 +534,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     import traceback
                     traceback.print_exc()
                     break
-        
+
         except asyncio.CancelledError:
             logger.info(f"{self}: Frame reader task cancelled (read {frames_read} frames)")
         except Exception as e:
@@ -515,41 +545,55 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily."""
+        """Consume video frames from queue and push to Daily with timing control."""
         logger.info(f"{self}: Video playback task started")
-        
+
         frames_pushed = 0
         try:
             while True:
                 try:
                     # Get frame from the queue (with timeout to check for cancellation)
-                    frame = await asyncio.wait_for(
+                    frame_data = await asyncio.wait_for(
                         self._video_frame_queue.get(),
                         timeout=0.1
                     )
-                    
-                    if frame is None:
+
+                    if frame_data is None:
                         logger.info(f"{self}: Received None, stopping video playback")
                         break
-                    
+
+                    # Unpack frame with timing info
+                    frame, frame_pts, expected_timestamp = frame_data
+
+                    # Wait until the expected timestamp to maintain frame rate
+                    current_time = time.time()
+                    wait_time = expected_timestamp - current_time
+
+                    if wait_time > 0:
+                        logger.debug(f"{self}: Waiting {wait_time*1000:.1f}ms before pushing frame (PTS={frame_pts:.3f}s)")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        # We're behind schedule
+                        logger.debug(f"{self}: Behind by {abs(wait_time)*1000:.1f}ms (PTS={frame_pts:.3f}s)")
+
                     frames_pushed += 1
-                    
+
                     if frames_pushed == 1:
-                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
+                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY! PTS={frame_pts:.3f}s")
                     elif frames_pushed % 10 == 0:
-                        logger.info(f"{self}: Pushed {frames_pushed} frames to Daily")
-                    
+                        logger.info(f"{self}: Pushed {frames_pushed} frames to Daily (PTS={frame_pts:.3f}s)")
+
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
                         image=frame,
                         size=(frame.shape[1], frame.shape[0]),  # (width, height)
                         format="RGB"
                     )
-                    
+
                     # Push to pipeline (this sends to Daily)
                     await self.push_frame(output_frame)
                     logger.debug(f"{self}: Pushed frame {frames_pushed} to Daily")
-                    
+
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
                     continue
@@ -558,7 +602,7 @@ class DittoTalkingHeadService(FrameProcessor):
                     import traceback
                     traceback.print_exc()
                     break
-        
+
         except asyncio.CancelledError:
             logger.info(f"{self}: Video playback task cancelled")
         except Exception as e:
