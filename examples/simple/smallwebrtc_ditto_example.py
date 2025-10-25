@@ -28,7 +28,6 @@ SETUP REQUIRED:
 
 5. Install SmallWebRTC dependencies:
    pip install pipecat-ai[webrtc]
-   pip install pipecat-ai-small-webrtc-prebuilt
 
 Example structure:
   your_project/
@@ -67,15 +66,9 @@ from typing import Dict
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
-
-try:
-    from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
-except ImportError:
-    logger.error("SmallWebRTC prebuilt UI not installed.")
-    logger.error("Please install: pip install pipecat-ai-small-webrtc-prebuilt")
-    raise
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import TextFrame
@@ -244,14 +237,18 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
 
-# Mount the frontend at /client
-app.mount("/client", SmallWebRTCPrebuiltUI)
+# Get the directory where this script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(SCRIPT_DIR, "static")
+
+# Mount static files (for future CSS/JS assets)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/", include_in_schema=False)
-async def root_redirect():
-    """Redirect root to the client UI."""
-    return RedirectResponse(url="/client/")
+async def root():
+    """Serve the custom WebRTC client."""
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
 @app.post("/api/offer")
