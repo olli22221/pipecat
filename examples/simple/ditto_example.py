@@ -180,6 +180,7 @@ async def main():
         source_image_path=source_image,  # Your avatar face image
         chunk_size=(3, 5, 2),  # (history, current, future) frames - must match model training
         save_frames_dir=save_frames_dir,  # Save frames to this directory
+        target_fps=30,  # Target FPS for PTS calculation (default: 25, try 30 or 60 for smoother video)
     )
 
     # Create context

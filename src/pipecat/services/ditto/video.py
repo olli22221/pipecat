@@ -61,6 +61,8 @@ class DittoTalkingHeadService(FrameProcessor):
         chunk_size: Audio chunk size tuple (history, current, future) frames
                    - Default (3, 5, 2) = ~200ms latency, 50% overlap
         save_frames_dir: Optional directory path to save generated frames as PNG files
+        target_fps: Target frame rate for PTS calculation (default: 25)
+                   - Note: Actual FPS depends on SDK generation speed
         **kwargs: Additional arguments passed to FrameProcessor
     """
 
@@ -73,16 +75,18 @@ class DittoTalkingHeadService(FrameProcessor):
         source_image_path: str,
         chunk_size: tuple = (3, 5, 2),
         save_frames_dir: Optional[str] = None,
+        target_fps: int = 25,
         **kwargs
     ):
         super().__init__(**kwargs)
-        
+
         self._ditto_path = ditto_path
         self._data_root = data_root
         self._cfg_pkl = cfg_pkl
         self._source_image_path = source_image_path
         self._chunk_size = chunk_size
         self._save_frames_dir = save_frames_dir
+        self._target_fps = target_fps
         
         # Initialize ALL queues and state variables
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
@@ -104,7 +108,6 @@ class DittoTalkingHeadService(FrameProcessor):
 
         # Timing and synchronization
         self._video_frame_count = 0  # Total video frames generated
-        self._target_fps = 25  # Target frame rate
         self._audio_sample_rate = 16000  # Sample rate we use for audio processing
         self._first_audio_pts = None  # PTS of first audio frame (nanoseconds)
         
