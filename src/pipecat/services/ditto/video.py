@@ -428,6 +428,11 @@ class DittoTalkingHeadService(FrameProcessor):
         # Mark when we start processing this chunk
         chunk_start_frame_count = self._video_frame_count
 
+        # Store audio frames BEFORE running SDK so they're ready when frames are generated
+        if audio_frames:
+            self._current_audio_frames.extend(audio_frames)
+            logger.debug(f"{self}: Stored {len(audio_frames)} audio frames before SDK processing")
+
         # Run SDK processing in executor (non-blocking)
         # This will generate video frames that get captured by our wrapper
         await asyncio.get_event_loop().run_in_executor(
@@ -439,11 +444,6 @@ class DittoTalkingHeadService(FrameProcessor):
 
         # Update history for next chunk
         self._audio_history = audio_chunk
-
-        # Store audio frames for the next generated video frames
-        # The SDK generates frames asynchronously, so we'll attach audio to the next frame
-        if audio_frames:
-            self._current_audio_frames.extend(audio_frames)
 
     async def _finalize_audio(self):
         """Process any remaining audio in the buffer after TTS stops."""
