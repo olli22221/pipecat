@@ -88,6 +88,7 @@ class DittoTalkingHeadService(FrameProcessor):
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
         self._audio_queue = None  # Will be initialized when audio task is created
         self._current_audio_frames = []  # Audio frames for the current chunk being processed
+        self._frames_in_current_chunk = 0  # Track position within chunk (chunk_size[1] frames per chunk)
 
         # SDK and initialization state
         self._sdk = None
@@ -366,6 +367,7 @@ class DittoTalkingHeadService(FrameProcessor):
             # Reset timing tracking
             self._video_frame_count = 0
             self._first_audio_pts = None
+            self._frames_in_current_chunk = 0
             # Note: event_id will be set when first audio frame arrives
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -400,6 +402,7 @@ class DittoTalkingHeadService(FrameProcessor):
         # Reset timing
         self._video_frame_count = 0
         self._first_audio_pts = None
+        self._frames_in_current_chunk = 0
 
         # Cancel and restart audio task
         await self._cancel_audio_task()
@@ -425,10 +428,11 @@ class DittoTalkingHeadService(FrameProcessor):
 
         logger.debug(f"{self}: Running SDK chunk (total: {len(padded_audio)} samples)")
 
-        # Mark when we start processing this chunk
-        chunk_start_frame_count = self._video_frame_count
+        # Reset frame counter for new chunk - this chunk will generate chunk_size[1] frames
+        self._frames_in_current_chunk = 0
 
         # Store audio frames BEFORE running SDK so they're ready when frames are generated
+        # These will only be attached to the FIRST frame of this chunk
         if audio_frames:
             self._current_audio_frames.extend(audio_frames)
             logger.debug(f"{self}: Stored {len(audio_frames)} audio frames before SDK processing")
@@ -529,9 +533,18 @@ class DittoTalkingHeadService(FrameProcessor):
                     # Each frame represents 1/25 second = 40ms
                     frame_time_offset_s = self._video_frame_count / self._target_fps
 
-                    # Get audio frames to push with this video frame
-                    audio_frames_to_push = self._current_audio_frames.copy()
-                    self._current_audio_frames.clear()
+                    # Only attach audio frames to the FIRST frame of each chunk
+                    # Each chunk generates chunk_size[1] frames (typically 5)
+                    audio_frames_to_push = []
+                    if self._frames_in_current_chunk == 0:
+                        # First frame of chunk - attach all audio frames from this chunk
+                        audio_frames_to_push = self._current_audio_frames.copy()
+                        self._current_audio_frames.clear()
+                        logger.debug(f"{self}: Attached {len(audio_frames_to_push)} audio frames to first video frame of chunk")
+
+                    # Increment frame counter within chunk
+                    self._frames_in_current_chunk += 1
+                    # Reset will happen in _process_single_chunk when new chunk starts
 
                     frames_read += 1
                     self._video_frame_count += 1
