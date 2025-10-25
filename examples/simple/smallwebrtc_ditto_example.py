@@ -231,6 +231,23 @@ async def run_ditto_bot(webrtc_connection: SmallWebRTCConnection):
     await runner.run(task)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    yield  # Run app
+    # Cleanup on shutdown
+    coros = [pc.disconnect() for pc in pcs_map.values()]
+    await asyncio.gather(*coros)
+    pcs_map.clear()
+
+
+# Create FastAPI app with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# Mount the frontend at /client
+app.mount("/client", SmallWebRTCPrebuiltUI)
+
+
 @app.get("/", include_in_schema=False)
 async def root_redirect():
     """Redirect root to the client UI."""
@@ -269,23 +286,6 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
     pcs_map[answer["pc_id"]] = pipecat_connection
 
     return answer
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage application lifecycle."""
-    yield  # Run app
-    # Cleanup on shutdown
-    coros = [pc.disconnect() for pc in pcs_map.values()]
-    await asyncio.gather(*coros)
-    pcs_map.clear()
-
-
-# Create FastAPI app with lifespan
-app = FastAPI(lifespan=lifespan)
-
-# Mount the frontend at /client
-app.mount("/client", SmallWebRTCPrebuiltUI)
 
 
 if __name__ == "__main__":
