@@ -63,6 +63,9 @@ class DittoTalkingHeadService(FrameProcessor):
         save_frames_dir: Optional directory path to save generated frames as PNG files
         target_fps: Target frame rate for PTS calculation (default: 50)
                    - Note: Actual FPS depends on SDK generation speed
+        lookahead_chunks: Number of chunks to buffer before starting playback (default: 2)
+                   - Higher values = better A/V sync but more latency
+                   - Each chunk = 5 frames at 25fps = 200ms
         **kwargs: Additional arguments passed to FrameProcessor
     """
 
@@ -76,6 +79,7 @@ class DittoTalkingHeadService(FrameProcessor):
         chunk_size: tuple = (3, 5, 2),
         save_frames_dir: Optional[str] = None,
         target_fps: int = 50,
+        lookahead_chunks: int = 2,  # How many chunks to buffer ahead for better sync
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -87,6 +91,7 @@ class DittoTalkingHeadService(FrameProcessor):
         self._chunk_size = chunk_size
         self._save_frames_dir = save_frames_dir
         self._target_fps = target_fps
+        self._lookahead_chunks = lookahead_chunks
         
         # Initialize ALL queues and state variables
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
@@ -116,7 +121,11 @@ class DittoTalkingHeadService(FrameProcessor):
         self._frame_reader_task = None
         self._video_playback_task = None
         self._frame_capture_queue = None  # Will be set in start()
-        
+
+        # Lookahead buffering for better A/V sync
+        self._buffered_chunks = 0  # Number of chunks buffered and ready
+        self._is_buffering = True  # Are we still building initial buffer?
+
         # Create save directory if specified
         if self._save_frames_dir:
             os.makedirs(self._save_frames_dir, exist_ok=True)
@@ -372,6 +381,9 @@ class DittoTalkingHeadService(FrameProcessor):
             self._video_frame_count = 0
             self._first_audio_pts = None
             self._frames_in_current_chunk = 0
+            # Reset buffering for new utterance
+            self._buffered_chunks = 0
+            self._is_buffering = True
             # Note: event_id will be set when first audio frame arrives
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -407,6 +419,10 @@ class DittoTalkingHeadService(FrameProcessor):
         self._video_frame_count = 0
         self._first_audio_pts = None
         self._frames_in_current_chunk = 0
+
+        # Reset buffering
+        self._buffered_chunks = 0
+        self._is_buffering = True
 
         # Cancel and restart audio task
         await self._cancel_audio_task()
@@ -591,11 +607,39 @@ class DittoTalkingHeadService(FrameProcessor):
         finally:
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
+    async def _push_frame_data(self, frame_data):
+        """Helper to push a single frame (video + audio) downstream."""
+        frame, frame_time_offset_s, audio_frames = frame_data
+
+        # Create OutputImageRawFrame for Daily
+        output_frame = OutputImageRawFrame(
+            image=frame,
+            size=(frame.shape[1], frame.shape[0]),  # (width, height)
+            format="RGB"
+        )
+
+        # Set PTS if we have audio timing
+        if self._first_audio_pts is not None:
+            # Convert frame_time_offset from seconds to nanoseconds and add to first audio PTS
+            frame_pts_ns = self._first_audio_pts + int(frame_time_offset_s * 1_000_000_000)
+            output_frame.pts = frame_pts_ns
+            logger.debug(f"{self}: Frame PTS={frame_pts_ns}ns (offset={frame_time_offset_s:.3f}s)")
+
+        # Push video frame FIRST to give it a head start (video is ~8MB, audio is ~KB)
+        await self.push_frame(output_frame)
+        logger.debug(f"{self}: Pushed video frame to Daily")
+
+        # Push corresponding audio frames AFTER video (audio will catch up due to smaller size)
+        for audio_frame in audio_frames:
+            await self.push_frame(audio_frame)
+            logger.debug(f"{self}: Pushed audio frame")
+
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily immediately."""
-        logger.info(f"{self}: Video playback task started")
+        """Consume video frames from queue with lookahead buffering for better sync."""
+        logger.info(f"{self}: Video playback task started (lookahead: {self._lookahead_chunks} chunks)")
 
         frames_pushed = 0
+        buffered_frames = []  # Lookahead buffer
 
         try:
             while True:
@@ -607,39 +651,39 @@ class DittoTalkingHeadService(FrameProcessor):
                     )
 
                     if frame_data is None:
-                        logger.info(f"{self}: Received None, stopping video playback")
+                        logger.info(f"{self}: Received None, flushing buffer and stopping")
+                        # Flush remaining buffered frames
+                        for buffered_frame_data in buffered_frames:
+                            await self._push_frame_data(buffered_frame_data)
+                            frames_pushed += 1
                         break
 
+                    # Add to buffer
+                    buffered_frames.append(frame_data)
                     frame, frame_time_offset_s, audio_frames = frame_data
-                    frames_pushed += 1
 
-                    if frames_pushed == 1:
-                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
-                    elif frames_pushed % 10 == 0:
-                        logger.info(f"{self}: Pushed {frames_pushed} frames to Daily")
+                    # Track chunks (first frame of chunk has audio frames)
+                    if len(audio_frames) > 0:
+                        self._buffered_chunks += 1
+                        if self._is_buffering:
+                            logger.info(f"{self}: Buffering chunk {self._buffered_chunks}/{self._lookahead_chunks}")
 
-                    # Create OutputImageRawFrame for Daily
-                    output_frame = OutputImageRawFrame(
-                        image=frame,
-                        size=(frame.shape[1], frame.shape[0]),  # (width, height)
-                        format="RGB"
-                    )
+                    # Check if we've buffered enough to start pushing
+                    if self._is_buffering and self._buffered_chunks >= self._lookahead_chunks:
+                        self._is_buffering = False
+                        logger.info(f"{self}: ✅ Lookahead buffer full ({self._buffered_chunks} chunks), starting playback")
 
-                    # Set PTS if we have audio timing
-                    if self._first_audio_pts is not None:
-                        # Convert frame_time_offset from seconds to nanoseconds and add to first audio PTS
-                        frame_pts_ns = self._first_audio_pts + int(frame_time_offset_s * 1_000_000_000)
-                        output_frame.pts = frame_pts_ns
-                        logger.debug(f"{self}: Frame PTS={frame_pts_ns}ns (offset={frame_time_offset_s:.3f}s)")
+                    # Only push if we're not buffering (i.e., buffer is full)
+                    if not self._is_buffering:
+                        # Push the oldest frame from buffer
+                        oldest_frame_data = buffered_frames.pop(0)
+                        await self._push_frame_data(oldest_frame_data)
+                        frames_pushed += 1
 
-                    # Push video frame FIRST to give it a head start (video is ~8MB, audio is ~KB)
-                    await self.push_frame(output_frame)
-                    logger.debug(f"{self}: Pushed video frame {frames_pushed} to Daily")
-
-                    # Push corresponding audio frames AFTER video (audio will catch up due to smaller size)
-                    for audio_frame in audio_frames:
-                        await self.push_frame(audio_frame)
-                        logger.debug(f"{self}: Pushed audio frame with video frame {frames_pushed}")
+                        if frames_pushed == 1:
+                            logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
+                        elif frames_pushed % 10 == 0:
+                            logger.info(f"{self}: Pushed {frames_pushed} frames to Daily")
 
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
