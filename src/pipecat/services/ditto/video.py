@@ -341,6 +341,7 @@ class DittoTalkingHeadService(FrameProcessor):
 
                         # Pass collected audio frames with the chunk
                         audio_frames_for_chunk = self._current_audio_frames.copy()
+                        logger.info(f"{self}: Passing {len(audio_frames_for_chunk)} audio frames to chunk processing")
                         self._current_audio_frames.clear()
 
                         await self._process_single_chunk(chunk_float, audio_frames_for_chunk)
@@ -429,16 +430,18 @@ class DittoTalkingHeadService(FrameProcessor):
             padding = np.zeros(1920, dtype=np.float32)
             padded_audio = np.concatenate([padding, audio_chunk])
 
+        logger.info(f"{self}: Processing chunk - received {len(audio_frames) if audio_frames else 0} audio frames")
         logger.debug(f"{self}: Running SDK chunk (total: {len(padded_audio)} samples)")
 
         # Reset frame counter for new chunk - this chunk will generate chunk_size[1] frames
         self._frames_in_current_chunk = 0
+        logger.info(f"{self}: Reset frames_in_current_chunk to 0, _current_audio_frames has {len(self._current_audio_frames)} frames")
 
         # Store audio frames BEFORE running SDK so they're ready when frames are generated
         # These will only be attached to the FIRST frame of this chunk
         if audio_frames:
             self._current_audio_frames.extend(audio_frames)
-            logger.debug(f"{self}: Stored {len(audio_frames)} audio frames before SDK processing")
+            logger.info(f"{self}: Stored {len(audio_frames)} audio frames, _current_audio_frames now has {len(self._current_audio_frames)} frames")
 
         # Run SDK processing in executor (non-blocking)
         # This will generate video frames that get captured by our wrapper
@@ -549,9 +552,10 @@ class DittoTalkingHeadService(FrameProcessor):
                     audio_frames_to_push = []
                     if self._frames_in_current_chunk == 0:
                         # First frame of chunk - attach all audio frames from this chunk
+                        logger.info(f"{self}: First frame of chunk! _current_audio_frames has {len(self._current_audio_frames)} frames")
                         audio_frames_to_push = self._current_audio_frames.copy()
                         self._current_audio_frames.clear()
-                        logger.debug(f"{self}: Attached {len(audio_frames_to_push)} audio frames to first video frame of chunk")
+                        logger.info(f"{self}: Attached {len(audio_frames_to_push)} audio frames to first video frame of chunk")
 
                     # Increment frame counter within chunk
                     self._frames_in_current_chunk += 1
