@@ -87,6 +87,7 @@ class DittoTalkingHeadService(FrameProcessor):
         # Initialize ALL queues and state variables
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
         self._audio_queue = None  # Will be initialized when audio task is created
+        self._current_audio_frames = []  # Audio frames for the current chunk being processed
 
         # SDK and initialization state
         self._sdk = None
@@ -101,10 +102,10 @@ class DittoTalkingHeadService(FrameProcessor):
         self._resampler = create_stream_resampler()  # Audio resampler
 
         # Timing and synchronization
-        self._audio_start_time = None  # When audio processing started
-        self._audio_samples_processed = 0  # Total audio samples processed (at 16kHz)
         self._video_frame_count = 0  # Total video frames generated
         self._target_fps = 25  # Target frame rate
+        self._audio_sample_rate = 16000  # Sample rate we use for audio processing
+        self._first_audio_pts = None  # PTS of first audio frame (nanoseconds)
         
         # Frame reading/playback state
         self._frame_reader_running = False
@@ -308,6 +309,14 @@ class DittoTalkingHeadService(FrameProcessor):
                         self._event_id = str(frame.id)
                         logger.info(f"{self}: Starting new utterance {self._event_id}")
 
+                    # Capture PTS from first audio frame
+                    if self._first_audio_pts is None and frame.pts is not None:
+                        self._first_audio_pts = frame.pts
+                        logger.info(f"{self}: Captured first audio PTS: {frame.pts} ns")
+
+                    # Collect this audio frame
+                    self._current_audio_frames.append(frame)
+
                     # Resample audio to 16kHz
                     audio_resampled = await self._resampler.resample(
                         frame.audio, frame.sample_rate, 16000
@@ -326,7 +335,11 @@ class DittoTalkingHeadService(FrameProcessor):
                         chunk_array = np.frombuffer(chunk_bytes, dtype=np.int16)
                         chunk_float = chunk_array.astype(np.float32) / 32768.0
 
-                        await self._process_single_chunk(chunk_float)
+                        # Pass collected audio frames with the chunk
+                        audio_frames_for_chunk = self._current_audio_frames.copy()
+                        self._current_audio_frames.clear()
+
+                        await self._process_single_chunk(chunk_float, audio_frames_for_chunk)
 
                 self._audio_queue.task_done()
 
@@ -349,10 +362,10 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Starting new TTS utterance")
             self._is_interrupting = False
             self._audio_buffer.clear()
+            self._current_audio_frames.clear()
             # Reset timing tracking
-            self._audio_start_time = time.time()
-            self._audio_samples_processed = 0
             self._video_frame_count = 0
+            self._first_audio_pts = None
             # Note: event_id will be set when first audio frame arrives
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -361,6 +374,8 @@ class DittoTalkingHeadService(FrameProcessor):
             else:
                 # Queue audio for processing
                 await self._audio_queue.put(frame)
+                # Don't push audio downstream yet - we'll push it with video
+                return
 
         elif isinstance(frame, TTSStoppedFrame):
             # The timeout in _audio_task_handler will handle finalization
@@ -379,12 +394,12 @@ class DittoTalkingHeadService(FrameProcessor):
         """Handle user interruption by stopping audio processing and restarting."""
         self._is_interrupting = True
         self._audio_buffer.clear()
+        self._current_audio_frames.clear()
         self._event_id = None
 
         # Reset timing
-        self._audio_start_time = None
-        self._audio_samples_processed = 0
         self._video_frame_count = 0
+        self._first_audio_pts = None
 
         # Cancel and restart audio task
         await self._cancel_audio_task()
@@ -398,7 +413,7 @@ class DittoTalkingHeadService(FrameProcessor):
             except asyncio.QueueEmpty:
                 break
 
-    async def _process_single_chunk(self, audio_chunk: np.ndarray):
+    async def _process_single_chunk(self, audio_chunk: np.ndarray, audio_frames: list = None):
         """Process a single 6480-sample chunk immediately."""
         # Add history padding (1920 samples from previous chunk)
         if len(self._audio_history) >= 1920:
@@ -410,7 +425,11 @@ class DittoTalkingHeadService(FrameProcessor):
 
         logger.debug(f"{self}: Running SDK chunk (total: {len(padded_audio)} samples)")
 
+        # Mark when we start processing this chunk
+        chunk_start_frame_count = self._video_frame_count
+
         # Run SDK processing in executor (non-blocking)
+        # This will generate video frames that get captured by our wrapper
         await asyncio.get_event_loop().run_in_executor(
             None,
             self._sdk.run_chunk,
@@ -421,8 +440,10 @@ class DittoTalkingHeadService(FrameProcessor):
         # Update history for next chunk
         self._audio_history = audio_chunk
 
-        # Track audio samples processed (for timestamp calculation)
-        self._audio_samples_processed += len(audio_chunk)
+        # Store audio frames for the next generated video frames
+        # The SDK generates frames asynchronously, so we'll attach audio to the next frame
+        if audio_frames:
+            self._current_audio_frames.extend(audio_frames)
 
     async def _finalize_audio(self):
         """Process any remaining audio in the buffer after TTS stops."""
@@ -504,27 +525,25 @@ class DittoTalkingHeadService(FrameProcessor):
                         logger.info(f"{self}: Received None from capture queue, stopping reader")
                         break
 
-                    # Calculate PTS for this frame
-                    # PTS = frame_number / fps (in seconds)
-                    frame_pts = self._video_frame_count / self._target_fps
+                    # Calculate frame timing based on frame count and target FPS
+                    # Each frame represents 1/25 second = 40ms
+                    frame_time_offset_s = self._video_frame_count / self._target_fps
 
-                    # Also calculate expected timestamp relative to audio start
-                    if self._audio_start_time is not None:
-                        expected_timestamp = self._audio_start_time + frame_pts
-                    else:
-                        expected_timestamp = time.time()
+                    # Get audio frames to push with this video frame
+                    audio_frames_to_push = self._current_audio_frames.copy()
+                    self._current_audio_frames.clear()
 
                     frames_read += 1
                     self._video_frame_count += 1
 
                     if frames_read == 1:
-                        logger.info(f"{self}: 🎉 FIRST FRAME CAPTURED! PTS={frame_pts:.3f}s")
+                        logger.info(f"{self}: 🎉 FIRST FRAME CAPTURED!")
                     elif frames_read % 10 == 0:
-                        logger.info(f"{self}: Read {frames_read} frames from SDK (PTS={frame_pts:.3f}s)")
+                        logger.info(f"{self}: Read {frames_read} frames from SDK")
 
-                    # Add to video playback queue with timing info
-                    await self._video_frame_queue.put((frame, frame_pts, expected_timestamp))
-                    logger.debug(f"{self}: Added frame to video queue (qsize={self._video_frame_queue.qsize()})")
+                    # Add frame to video playback queue with timing info and audio frames
+                    await self._video_frame_queue.put((frame, frame_time_offset_s, audio_frames_to_push))
+                    logger.debug(f"{self}: Added frame to video queue with {len(audio_frames_to_push)} audio frames (qsize={self._video_frame_queue.qsize()})")
 
                 except queue_module.Empty:
                     await asyncio.sleep(0.01)
@@ -545,10 +564,11 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily with timing control."""
+        """Consume video frames from queue and push to Daily immediately."""
         logger.info(f"{self}: Video playback task started")
 
         frames_pushed = 0
+
         try:
             while True:
                 try:
@@ -562,26 +582,18 @@ class DittoTalkingHeadService(FrameProcessor):
                         logger.info(f"{self}: Received None, stopping video playback")
                         break
 
-                    # Unpack frame with timing info
-                    frame, frame_pts, expected_timestamp = frame_data
-
-                    # Wait until the expected timestamp to maintain frame rate
-                    current_time = time.time()
-                    wait_time = expected_timestamp - current_time
-
-                    if wait_time > 0:
-                        logger.debug(f"{self}: Waiting {wait_time*1000:.1f}ms before pushing frame (PTS={frame_pts:.3f}s)")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        # We're behind schedule
-                        logger.debug(f"{self}: Behind by {abs(wait_time)*1000:.1f}ms (PTS={frame_pts:.3f}s)")
-
+                    frame, frame_time_offset_s, audio_frames = frame_data
                     frames_pushed += 1
 
                     if frames_pushed == 1:
-                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY! PTS={frame_pts:.3f}s")
+                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
                     elif frames_pushed % 10 == 0:
-                        logger.info(f"{self}: Pushed {frames_pushed} frames to Daily (PTS={frame_pts:.3f}s)")
+                        logger.info(f"{self}: Pushed {frames_pushed} frames to Daily")
+
+                    # Push corresponding audio frames first (they need to go before video)
+                    for audio_frame in audio_frames:
+                        await self.push_frame(audio_frame)
+                        logger.debug(f"{self}: Pushed audio frame with video frame {frames_pushed}")
 
                     # Create OutputImageRawFrame for Daily
                     output_frame = OutputImageRawFrame(
@@ -590,9 +602,16 @@ class DittoTalkingHeadService(FrameProcessor):
                         format="RGB"
                     )
 
-                    # Push to pipeline (this sends to Daily)
+                    # Set PTS if we have audio timing
+                    if self._first_audio_pts is not None:
+                        # Convert frame_time_offset from seconds to nanoseconds and add to first audio PTS
+                        frame_pts_ns = self._first_audio_pts + int(frame_time_offset_s * 1_000_000_000)
+                        output_frame.pts = frame_pts_ns
+                        logger.debug(f"{self}: Frame PTS={frame_pts_ns}ns (offset={frame_time_offset_s:.3f}s)")
+
+                    # Push video frame
                     await self.push_frame(output_frame)
-                    logger.debug(f"{self}: Pushed frame {frames_pushed} to Daily")
+                    logger.debug(f"{self}: Pushed video frame {frames_pushed} to Daily")
 
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
