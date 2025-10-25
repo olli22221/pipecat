@@ -56,17 +56,6 @@ SmallWebRTC has built-in timing synchronization that respects PTS timestamps:
 
 Daily transport ignores PTS timestamps and pushes frames immediately, causing
 audio-video sync issues with large video frames (8.3MB vs KB for audio).
-
-ICE SERVER CONFIGURATION:
-------------------------
-This example uses both STUN and TURN servers:
-- STUN: Works for simple NAT scenarios (direct peer-to-peer)
-- TURN: Required for symmetric NAT and corporate firewalls (relay server)
-
-If connection fails (stuck at "connecting"):
-1. Check your firewall allows WebRTC traffic
-2. Try a different TURN server (see https://gist.github.com/sagivo/3a4b2f2c7ac6e1b5267c2f1f59ac6c6b)
-3. Use environment variable TURN_URL, TURN_USERNAME, TURN_PASSWORD to override
 """
 
 import argparse
@@ -113,48 +102,12 @@ app = FastAPI()
 # Store connections by pc_id
 pcs_map: Dict[str, SmallWebRTCConnection] = {}
 
-# ICE servers for NAT traversal
-# STUN is for simple NAT, TURN is for symmetric NAT/firewalls
-def get_ice_servers():
-    """Get ICE servers with optional custom TURN server from env vars."""
-    servers = [
-        # Google's free STUN server
-        IceServer(
-            urls="stun:stun.l.google.com:19302",
-        ),
-    ]
-
-    # Check for custom TURN server configuration
-    turn_url = os.getenv("TURN_URL")
-    turn_username = os.getenv("TURN_USERNAME")
-    turn_password = os.getenv("TURN_PASSWORD")
-
-    if turn_url and turn_username and turn_password:
-        logger.info(f"Using custom TURN server: {turn_url}")
-        servers.append(
-            IceServer(
-                urls=turn_url,
-                username=turn_username,
-                credential=turn_password,
-            )
-        )
-    else:
-        # Use Open Relay Project - Free TURN server
-        # See: https://www.metered.ca/tools/openrelay/
-        logger.info("Using Open Relay Project TURN server")
-        servers.append(
-            IceServer(
-                urls=[
-                    "stun:openrelay.metered.ca:80",
-                    "turn:openrelay.metered.ca:80",
-                    "turn:openrelay.metered.ca:443",
-                ],
-                username="openrelayproject",
-                credential="openrelayproject",
-            )
-        )
-
-    return servers
+# ICE servers for NAT traversal (matching foundational example)
+ice_servers = [
+    IceServer(
+        urls="stun:stun.l.google.com:19302",
+    )
+]
 
 # Mount the frontend at /client
 app.mount("/client", SmallWebRTCPrebuiltUI)
@@ -304,7 +257,7 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
         )
     else:
         # Create new connection with ICE servers
-        pipecat_connection = SmallWebRTCConnection(get_ice_servers())
+        pipecat_connection = SmallWebRTCConnection(ice_servers)
         await pipecat_connection.initialize(sdp=request["sdp"], type=request["type"])
 
         @pipecat_connection.event_handler("closed")
