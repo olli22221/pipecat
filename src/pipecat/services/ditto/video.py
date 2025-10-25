@@ -516,17 +516,19 @@ class DittoTalkingHeadService(FrameProcessor):
                 # Queue audio for processing by Ditto (generates video)
                 await self._audio_queue.put(frame)
 
-                # Calculate timestamp for this audio frame based on when it arrives
-                # This will be used to synchronize audio pushing with video frames
-                audio_timestamp = self._base_timestamp + (self._audio_samples_pushed / 16000.0)
+                # Calculate timestamp based on processing position (not arrival time)
+                # This matches the timestamp that video frames will have when generated
+                # We use _audio_samples_processed (how much has been sent to Ditto)
+                # This ensures audio and video timestamps stay synchronized
+                num_samples = len(frame.audio) // 2  # 16-bit = 2 bytes per sample
+                audio_timestamp = self._base_timestamp + (self._audio_samples_processed / 16000.0)
 
                 # Buffer audio instead of pushing immediately - it will be pushed
                 # synchronously with video frames in _consume_and_push_video()
                 self._audio_frame_buffer.append((frame, audio_timestamp, direction))
                 logger.info(f"{self}: Buffered TTS audio ({len(frame.audio)} bytes) at timestamp {audio_timestamp:.3f}s (buffer size: {len(self._audio_frame_buffer)})")
 
-                # Update audio sample counter for timestamp tracking
-                num_samples = len(frame.audio) // 2  # 16-bit = 2 bytes per sample
+                # Update counter for tracking (video uses _audio_samples_processed)
                 self._audio_samples_pushed += num_samples
 
                 return  # Don't push again at the end
@@ -909,19 +911,20 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push with PTS-based timing.
+        """Consume video frames from queue and push with synchronized audio.
 
-        Uses PTS timestamps to pace video frame delivery, ensuring frames are pushed
-        at the correct wall-clock time relative to when audio was processed. This
-        provides proper A/V sync even when the transport doesn't use PTS timestamps.
+        Pushes video frames immediately as they're generated, with matching audio
+        frames that have the same PTS timestamps. Audio and video are pushed together
+        to ensure proper synchronization.
 
-        Pacing strategy:
-        - Each frame has a PTS timestamp from when its audio was processed
-        - We calculate when the frame should be pushed based on:
-          playback_start_time + (pts - base_pts)
-        - We wait until that time before pushing to ensure proper timing
+        Synchronization strategy:
+        - Audio is buffered when it arrives from TTS
+        - Video frames are generated from that audio by Ditto
+        - When pushing video, we also push all audio with matching/earlier PTS
+        - Both audio and video have the same timestamp (based on processing position)
+        - No artificial delays - frames pushed immediately for low latency
         """
-        logger.info(f"{self}: Video playback task started (PTS-based pacing for A/V sync)")
+        logger.info(f"{self}: Video playback task started (synchronized audio+video pushing)")
 
         frames_pushed = 0
         frame_interval = 1.0 / 20.0  # 50ms per frame at 20fps (for drift calculation only)
@@ -963,31 +966,21 @@ class DittoTalkingHeadService(FrameProcessor):
                         base_pts = audio_timestamp
                         logger.info(f"{self}: Starting video playback at {playback_start_time:.3f}s (base PTS: {base_pts:.3f}s)")
 
-                    # Calculate when this frame should be pushed based on its PTS timestamp
-                    # This ensures frames are delivered at the correct time relative to audio processing
-                    pts_offset = audio_timestamp - base_pts
-                    target_push_time = playback_start_time + pts_offset
-                    current_time = asyncio.get_event_loop().time()
-                    wait_time = target_push_time - current_time
-
-                    # Wait until it's time to push this frame (if we're early)
-                    if wait_time > 0:
-                        logger.debug(f"{self}: Waiting {wait_time*1000:.1f}ms before pushing frame (PTS pacing)")
-                        await asyncio.sleep(wait_time)
-                    elif wait_time < -0.1:  # More than 100ms late
-                        logger.warning(f"{self}: Frame is {-wait_time*1000:.1f}ms late (processing can't keep up)")
+                    # Push frames immediately with proper PTS timestamps
+                    # The transport layer will handle timing/pacing based on PTS
+                    # No artificial delays - push as soon as video is generated for low latency
 
                     frames_pushed += 1
 
                     if frames_pushed == 1:
-                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED (PTS: {audio_timestamp:.3f}s, wait: {max(0, wait_time)*1000:.1f}ms)")
+                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED (PTS: {audio_timestamp:.3f}s)")
                     elif frames_pushed % 10 == 0:
-                        logger.info(f"{self}: Pushed {frames_pushed} frames (PTS pacing active)")
+                        logger.info(f"{self}: Pushed {frames_pushed} frames with synced audio")
                     elif frames_pushed <= 5:
-                        logger.info(f"{self}: Pushed frame {frames_pushed} (PTS: {audio_timestamp:.3f}s, wait: {max(0, wait_time)*1000:.1f}ms)")
+                        logger.info(f"{self}: Pushed frame {frames_pushed} (PTS: {audio_timestamp:.3f}s)")
 
-                    # Drift tracking: Monitor timing accuracy of PTS-based pacing
-                    # This helps detect if frame generation is falling behind schedule
+                    # Drift tracking: Monitor timing between video generation and audio arrival
+                    # This helps detect if Ditto processing is falling behind
                     expected_playback_time = frames_pushed * frame_interval
                     actual_processed_time = audio_timestamp - (self._base_timestamp or 0)
                     drift = expected_playback_time - actual_processed_time
@@ -1009,13 +1002,13 @@ class DittoTalkingHeadService(FrameProcessor):
                         output_frame.pts = audio_timestamp
 
                     # Push any pending audio frames before pushing video
-                    # This ensures audio and video are pushed synchronously for proper A/V sync
+                    # This ensures audio and video are pushed together for proper A/V sync
                     await self._push_pending_audio(audio_timestamp)
 
-                    # Push video frame with PTS-based timing for accurate A/V sync
+                    # Push video frame immediately with matching audio
                     await self.push_frame(output_frame)
 
-                    logger.debug(f"{self}: Pushed frame {frames_pushed} (PTS: {audio_timestamp:.3f}s, paced delivery)")
+                    logger.debug(f"{self}: Pushed frame {frames_pushed} with audio (PTS: {audio_timestamp:.3f}s)")
 
                 except asyncio.TimeoutError:
                     # No frame available, continue waiting
@@ -1027,10 +1020,10 @@ class DittoTalkingHeadService(FrameProcessor):
                     break
 
         except asyncio.CancelledError:
-            logger.info(f"{self}: Video playback task cancelled (PTS pacing)")
+            logger.info(f"{self}: Video playback task cancelled (synced audio+video)")
         except Exception as e:
             logger.error(f"{self}: Error in video playback: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            logger.info(f"{self}: Video playback finished with PTS pacing (pushed {frames_pushed} frames)")
+            logger.info(f"{self}: Video playback finished with synced audio (pushed {frames_pushed} frames)")
