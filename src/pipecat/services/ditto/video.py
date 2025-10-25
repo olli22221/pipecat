@@ -442,12 +442,20 @@ class DittoTalkingHeadService(FrameProcessor):
 
         # Run SDK processing in executor (non-blocking)
         # This will generate video frames that get captured by our wrapper
+        start_time = time.time()
         await asyncio.get_event_loop().run_in_executor(
             None,
             self._sdk.run_chunk,
             padded_audio,
             self._chunk_size
         )
+        end_time = time.time()
+
+        # Calculate and log generation speed
+        generation_time = end_time - start_time
+        frames_generated = self._chunk_size[1]  # Current frames (typically 5)
+        fps = frames_generated / generation_time if generation_time > 0 else 0
+        logger.info(f"{self}: Generated {frames_generated} frames in {generation_time:.3f}s ({fps:.1f} fps)")
 
         # Update history for next chunk
         self._audio_history = audio_chunk
