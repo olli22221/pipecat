@@ -139,9 +139,16 @@
         const logDiv = document.getElementById('log');
 
         // ICE servers configuration
-        const iceServers = [
-            { urls: 'stun:stun.l.google.com:19302' }
-        ];
+        // For localhost testing, empty iceServers array works best (uses host candidates only)
+        // Add STUN/TURN servers here if deploying to production
+        const iceServers = [];
+
+        // RTCPeerConnection configuration
+        const pcConfig = {
+            iceServers: iceServers,
+            iceTransportPolicy: 'all',  // Use all candidates
+            iceCandidatePoolSize: 0
+        };
 
         function log(message) {
             console.log(message);
@@ -190,7 +197,12 @@
 
             // Create peer connection
             log('Creating RTCPeerConnection...');
-            peerConnection = new RTCPeerConnection({ iceServers });
+            peerConnection = new RTCPeerConnection(pcConfig);
+
+            // Create data channel (helps establish connection)
+            const dataChannel = peerConnection.createDataChannel('chat');
+            dataChannel.onopen = () => log('Data channel opened');
+            dataChannel.onclose = () => log('Data channel closed');
 
             // Add local stream tracks
             localStream.getTracks().forEach(track => {
