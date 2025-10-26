@@ -94,11 +94,8 @@ load_dotenv(override=True)
 pcs_map: Dict[str, SmallWebRTCConnection] = {}
 
 # ICE servers for NAT traversal (matching foundational example)
-ice_servers = [
-    IceServer(
-        urls="stun:stun.l.google.com:19302",
-    )
-]
+# For localhost, use empty array to force host-only candidates
+ice_servers = []
 
 
 async def run_ditto_bot(webrtc_connection: SmallWebRTCConnection):
