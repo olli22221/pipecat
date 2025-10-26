@@ -68,6 +68,10 @@ class DittoTalkingHeadService(FrameProcessor):
         jpeg_quality: JPEG quality level 1-100 (default: 75)
                      - Higher = better quality but larger size
                      - 75 is good balance of quality vs bandwidth
+        chunks_to_buffer: Number of chunks to buffer before pushing (default: 3)
+                         - Each chunk = chunk_size[1] frames (typically 5)
+                         - 3 chunks = 15 frames buffered before push
+                         - Higher = larger batches, less frequent pushes, smoother playback
         **kwargs: Additional arguments passed to FrameProcessor
     """
 
@@ -83,6 +87,7 @@ class DittoTalkingHeadService(FrameProcessor):
         target_fps: int = 50,
         compress_frames: bool = True,
         jpeg_quality: int = 75,
+        chunks_to_buffer: int = 3,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -96,6 +101,7 @@ class DittoTalkingHeadService(FrameProcessor):
         self._target_fps = target_fps
         self._compress_frames = compress_frames
         self._jpeg_quality = jpeg_quality
+        self._chunks_to_buffer = chunks_to_buffer
         
         # Initialize ALL queues and state variables
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
@@ -601,12 +607,14 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push them with rate limiting."""
+        """Consume video frames from queue and push them with multi-chunk buffering."""
         logger.info(f"{self}: Video playback task started")
+        logger.info(f"{self}: Buffering {self._chunks_to_buffer} chunks ({self._chunks_to_buffer * self._chunk_size[1]} frames) before push")
 
         frames_pushed = 0
-        chunk_buffer = []  # Buffer for accumulating chunk frames
-        chunk_audio_frames = None  # Audio frames for the current chunk
+        multi_chunk_buffer = []  # Buffer for accumulating multiple chunks
+        current_chunk_audio = None  # Audio for the first chunk in multi-chunk buffer
+        chunks_buffered = 0  # Count of complete chunks in buffer
         last_push_time = None
 
         try:
@@ -620,9 +628,9 @@ class DittoTalkingHeadService(FrameProcessor):
 
                     if frame_data is None:
                         # Push any remaining buffered frames before stopping
-                        if chunk_buffer:
-                            await self._push_chunk_bundle(chunk_buffer, chunk_audio_frames, frames_pushed)
-                            frames_pushed += len(chunk_buffer)
+                        if multi_chunk_buffer:
+                            await self._push_chunk_bundle(multi_chunk_buffer, current_chunk_audio, frames_pushed)
+                            frames_pushed += len(multi_chunk_buffer)
                         logger.info(f"{self}: Received None, stopping video playback")
                         break
 
@@ -675,58 +683,51 @@ class DittoTalkingHeadService(FrameProcessor):
 
                     # If this frame has audio, it's the first frame of a new chunk
                     if audio_frames and len(audio_frames) > 0:
-                        # Push previous chunk if any
-                        if chunk_buffer:
-                            # Rate limiting: wait to match target FPS
-                            if last_push_time is not None:
-                                # Calculate how long the chunk should take to play
-                                chunk_duration_s = len(chunk_buffer) / self._target_fps
-                                elapsed = time.time() - last_push_time
-                                wait_time = chunk_duration_s - elapsed
+                        # Save audio only for the first chunk in multi-chunk buffer
+                        if chunks_buffered == 0:
+                            current_chunk_audio = audio_frames
 
-                                if wait_time > 0:
-                                    logger.debug(f"{self}: Rate limiting - waiting {wait_time:.3f}s before pushing chunk")
-                                    await asyncio.sleep(wait_time)
+                        # Increment chunk counter (new chunk starting)
+                        chunks_buffered += 1
 
-                            await self._push_chunk_bundle(chunk_buffer, chunk_audio_frames, frames_pushed)
-                            frames_pushed += len(chunk_buffer)
-                            last_push_time = time.time()
+                    # Add frame to multi-chunk buffer
+                    multi_chunk_buffer.append(output_frame)
 
-                        # Start new chunk
-                        chunk_buffer = [output_frame]
-                        chunk_audio_frames = audio_frames
-                    else:
-                        # Add to current chunk
-                        chunk_buffer.append(output_frame)
-
-                    # If chunk is complete (chunk_size[1] frames, typically 5)
-                    if len(chunk_buffer) >= self._chunk_size[1]:
+                    # Check if we've buffered enough chunks to push
+                    if chunks_buffered >= self._chunks_to_buffer:
                         # Rate limiting: wait to match target FPS
                         if last_push_time is not None:
-                            chunk_duration_s = len(chunk_buffer) / self._target_fps
+                            buffer_duration_s = len(multi_chunk_buffer) / self._target_fps
                             elapsed = time.time() - last_push_time
-                            wait_time = chunk_duration_s - elapsed
+                            wait_time = buffer_duration_s - elapsed
 
                             if wait_time > 0:
-                                logger.debug(f"{self}: Rate limiting - waiting {wait_time:.3f}s before pushing chunk")
+                                logger.debug(f"{self}: Rate limiting - waiting {wait_time:.3f}s before pushing {chunks_buffered} chunks")
                                 await asyncio.sleep(wait_time)
 
-                        await self._push_chunk_bundle(chunk_buffer, chunk_audio_frames, frames_pushed)
-                        frames_pushed += len(chunk_buffer)
+                        # Push the multi-chunk bundle
+                        await self._push_chunk_bundle(multi_chunk_buffer, current_chunk_audio, frames_pushed)
+
+                        if frames_pushed == 0:
+                            logger.info(f"{self}: First push: {len(multi_chunk_buffer)} frames ({chunks_buffered} chunks)")
+
+                        frames_pushed += len(multi_chunk_buffer)
                         last_push_time = time.time()
 
-                        # Reset chunk buffer
-                        chunk_buffer = []
-                        chunk_audio_frames = None
+                        # Reset buffer
+                        multi_chunk_buffer = []
+                        current_chunk_audio = None
+                        chunks_buffered = 0
 
                 except asyncio.TimeoutError:
-                    # No frame available, push any buffered frames
-                    if chunk_buffer:
-                        await self._push_chunk_bundle(chunk_buffer, chunk_audio_frames, frames_pushed)
-                        frames_pushed += len(chunk_buffer)
+                    # No frame available, push any buffered frames if we have at least 1 complete chunk
+                    if chunks_buffered >= 1:
+                        await self._push_chunk_bundle(multi_chunk_buffer, current_chunk_audio, frames_pushed)
+                        frames_pushed += len(multi_chunk_buffer)
                         last_push_time = time.time()
-                        chunk_buffer = []
-                        chunk_audio_frames = None
+                        multi_chunk_buffer = []
+                        current_chunk_audio = None
+                        chunks_buffered = 0
                     continue
                 except Exception as e:
                     logger.error(f"{self}: Error pushing video frame: {e}")

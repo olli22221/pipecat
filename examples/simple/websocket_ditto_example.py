@@ -323,9 +323,10 @@ async def start_bot():
         source_image_path=source_image,
         chunk_size=(3, 5, 2),
         save_frames_dir=save_frames_dir,
-        target_fps=30,
+        target_fps=60,  # Higher FPS for smoother playback
         compress_frames=True,  # Enable JPEG compression at source
         jpeg_quality=75,  # Balance quality vs size (75 = good quality, ~40-50x compression)
+        chunks_to_buffer=3,  # Buffer 3 chunks (15 frames) before pushing for smoother delivery
     )
 
     # WebSocket output processor
@@ -340,6 +341,7 @@ async def start_bot():
     )
 
     # Build pipeline with STT for microphone input
+    # Note: Audio input comes from WebSocket handler (lines 243-265), not from transport
     pipeline = Pipeline([
         stt,  # Speech-to-text from microphone
         LLMUserContextAggregator(context),
