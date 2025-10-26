@@ -201,6 +201,16 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.info("Starting Ditto bot...")
             asyncio.create_task(start_bot())
 
+            # Wait a bit for task to be initialized
+            for _ in range(50):  # Wait up to 5 seconds
+                await asyncio.sleep(0.1)
+                if task is not None:
+                    logger.info("Task initialized successfully")
+                    break
+
+            if task is None:
+                logger.error("Failed to initialize task!")
+
         # Keep connection alive and handle incoming messages
         while True:
             data = await websocket.receive_text()
@@ -210,8 +220,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"type": "pong"}))
             elif message.get("type") == "text":
                 # User sent text message (for testing without speech)
+                text = message.get("text", "")
+                logger.info(f"📨 Received text from client: {text}")
                 if task:
-                    await task.queue_frames([TextFrame(message.get("text", ""))])
+                    logger.info(f"Queueing TextFrame to pipeline...")
+                    await task.queue_frames([TextFrame(text)])
+                    logger.info(f"TextFrame queued successfully")
+                else:
+                    logger.error("Task is None, cannot queue frame!")
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")

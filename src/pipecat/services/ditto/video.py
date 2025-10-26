@@ -592,10 +592,13 @@ class DittoTalkingHeadService(FrameProcessor):
             logger.info(f"{self}: Frame reader finished (total frames: {frames_read})")
 
     async def _consume_and_push_video(self):
-        """Consume video frames from queue and push to Daily immediately."""
+        """Consume video frames from queue and push them with rate limiting."""
         logger.info(f"{self}: Video playback task started")
 
         frames_pushed = 0
+        chunk_buffer = []  # Buffer for accumulating chunk frames
+        chunk_audio_frames = None  # Audio frames for the current chunk
+        last_push_time = None
 
         try:
             while True:
@@ -607,18 +610,16 @@ class DittoTalkingHeadService(FrameProcessor):
                     )
 
                     if frame_data is None:
+                        # Push any remaining buffered frames before stopping
+                        if chunk_buffer:
+                            await self._push_chunk_bundle(chunk_buffer, chunk_audio_frames, frames_pushed)
+                            frames_pushed += len(chunk_buffer)
                         logger.info(f"{self}: Received None, stopping video playback")
                         break
 
                     frame, frame_time_offset_s, audio_frames = frame_data
-                    frames_pushed += 1
 
-                    if frames_pushed == 1:
-                        logger.info(f"{self}: 🎥 FIRST FRAME PUSHED TO DAILY!")
-                    elif frames_pushed % 10 == 0:
-                        logger.info(f"{self}: Pushed {frames_pushed} frames to Daily")
-
-                    # Create OutputImageRawFrame for Daily
+                    # Create OutputImageRawFrame
                     output_frame = OutputImageRawFrame(
                         image=frame,
                         size=(frame.shape[1], frame.shape[0]),  # (width, height)
@@ -627,29 +628,63 @@ class DittoTalkingHeadService(FrameProcessor):
 
                     # Set PTS if we have audio timing
                     if self._first_audio_pts is not None:
-                        # Convert frame_time_offset from seconds to nanoseconds and add to first audio PTS
                         frame_pts_ns = self._first_audio_pts + int(frame_time_offset_s * 1_000_000_000)
                         output_frame.pts = frame_pts_ns
-                        logger.debug(f"{self}: Frame PTS={frame_pts_ns}ns (offset={frame_time_offset_s:.3f}s)")
 
-                    # Bundle audio and video together and push concurrently
-                    # This ensures they arrive at the transport together, like H.264 multiplexing
-                    frames_to_push = []
+                    # If this frame has audio, it's the first frame of a new chunk
+                    if audio_frames and len(audio_frames) > 0:
+                        # Push previous chunk if any
+                        if chunk_buffer:
+                            # Rate limiting: wait to match target FPS
+                            if last_push_time is not None:
+                                # Calculate how long the chunk should take to play
+                                chunk_duration_s = len(chunk_buffer) / self._target_fps
+                                elapsed = time.time() - last_push_time
+                                wait_time = chunk_duration_s - elapsed
 
-                    # Add audio frames first to the bundle
-                    for audio_frame in audio_frames:
-                        frames_to_push.append(audio_frame)
+                                if wait_time > 0:
+                                    logger.debug(f"{self}: Rate limiting - waiting {wait_time:.3f}s before pushing chunk")
+                                    await asyncio.sleep(wait_time)
 
-                    # Add video frame to the bundle
-                    frames_to_push.append(output_frame)
+                            await self._push_chunk_bundle(chunk_buffer, chunk_audio_frames, frames_pushed)
+                            frames_pushed += len(chunk_buffer)
+                            last_push_time = time.time()
 
-                    # Push all frames concurrently so they arrive together as a bundle
-                    if len(frames_to_push) > 0:
-                        await asyncio.gather(*[self.push_frame(frame) for frame in frames_to_push])
-                        logger.debug(f"{self}: Pushed bundle of {len(frames_to_push)} frames (audio + video) to Daily")
+                        # Start new chunk
+                        chunk_buffer = [output_frame]
+                        chunk_audio_frames = audio_frames
+                    else:
+                        # Add to current chunk
+                        chunk_buffer.append(output_frame)
+
+                    # If chunk is complete (chunk_size[1] frames, typically 5)
+                    if len(chunk_buffer) >= self._chunk_size[1]:
+                        # Rate limiting: wait to match target FPS
+                        if last_push_time is not None:
+                            chunk_duration_s = len(chunk_buffer) / self._target_fps
+                            elapsed = time.time() - last_push_time
+                            wait_time = chunk_duration_s - elapsed
+
+                            if wait_time > 0:
+                                logger.debug(f"{self}: Rate limiting - waiting {wait_time:.3f}s before pushing chunk")
+                                await asyncio.sleep(wait_time)
+
+                        await self._push_chunk_bundle(chunk_buffer, chunk_audio_frames, frames_pushed)
+                        frames_pushed += len(chunk_buffer)
+                        last_push_time = time.time()
+
+                        # Reset chunk buffer
+                        chunk_buffer = []
+                        chunk_audio_frames = None
 
                 except asyncio.TimeoutError:
-                    # No frame available, continue waiting
+                    # No frame available, push any buffered frames
+                    if chunk_buffer:
+                        await self._push_chunk_bundle(chunk_buffer, chunk_audio_frames, frames_pushed)
+                        frames_pushed += len(chunk_buffer)
+                        last_push_time = time.time()
+                        chunk_buffer = []
+                        chunk_audio_frames = None
                     continue
                 except Exception as e:
                     logger.error(f"{self}: Error pushing video frame: {e}")
@@ -665,3 +700,30 @@ class DittoTalkingHeadService(FrameProcessor):
             traceback.print_exc()
         finally:
             logger.info(f"{self}: Video playback finished (pushed {frames_pushed} frames)")
+
+    async def _push_chunk_bundle(self, video_frames: list, audio_frames: list, total_pushed: int):
+        """Push a bundle of video frames with their corresponding audio frames."""
+        if not video_frames:
+            return
+
+        frames_to_push = []
+
+        # Add audio frames first (only attached to first frame of chunk)
+        if audio_frames:
+            for audio_frame in audio_frames:
+                frames_to_push.append(audio_frame)
+
+        # Add all video frames
+        for video_frame in video_frames:
+            frames_to_push.append(video_frame)
+
+        # Push entire bundle at once
+        if len(frames_to_push) > 0:
+            await asyncio.gather(*[self.push_frame(frame) for frame in frames_to_push])
+
+            if total_pushed == 0:
+                logger.info(f"{self}: 🎥 FIRST CHUNK PUSHED! ({len(video_frames)} video frames + {len(audio_frames) if audio_frames else 0} audio frames)")
+            elif total_pushed % 10 == 0:
+                logger.info(f"{self}: Pushed {total_pushed} frames total")
+
+            logger.debug(f"{self}: Pushed chunk bundle: {len(audio_frames) if audio_frames else 0} audio + {len(video_frames)} video = {len(frames_to_push)} total frames")
