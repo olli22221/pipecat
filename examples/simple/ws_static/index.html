@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ditto WebSocket Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f0f0f0;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .video-container {
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        canvas {
+            max-width: 100%;
+            background: #000;
+            border-radius: 5px;
+        }
+        .controls {
+            margin-top: 20px;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            margin-right: 10px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        button.connect {
+            background: #4CAF50;
+            color: white;
+        }
+        button.connect:hover {
+            background: #45a049;
+        }
+        button.disconnect {
+            background: #f44336;
+            color: white;
+        }
+        button.disconnect:hover {
+            background: #da190b;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .status.disconnected {
+            background: #ffebee;
+            color: #c62828;
+        }
+        .status.connecting {
+            background: #fff3e0;
+            color: #ef6c00;
+        }
+        .status.connected {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+        .chat-input {
+            margin-top: 20px;
+        }
+        .chat-input input {
+            padding: 10px;
+            font-size: 16px;
+            width: 70%;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        .chat-input button {
+            padding: 10px 20px;
+        }
+        .stats {
+            margin-top: 20px;
+            font-size: 14px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎬 Ditto Talking Head - WebSocket Streaming</h1>
+
+        <div class="video-container">
+            <h3>Ditto Video Stream</h3>
+            <canvas id="videoCanvas" width="720" height="960"></canvas>
+        </div>
+
+        <div class="controls">
+            <button id="connectBtn" class="connect">Connect</button>
+            <button id="disconnectBtn" class="disconnect" disabled>Disconnect</button>
+        </div>
+
+        <div class="chat-input">
+            <input type="text" id="messageInput" placeholder="Type a message and press Enter..." disabled>
+            <button id="sendBtn" disabled>Send</button>
+        </div>
+
+        <div id="status" class="status disconnected">
+            Status: Disconnected
+        </div>
+
+        <div class="stats" id="stats">
+            Frames: 0 | Audio chunks: 0 | FPS: 0
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let audioContext = null;
+        let audioQueue = [];
+        let isPlayingAudio = false;
+
+        const canvas = document.getElementById('videoCanvas');
+        const ctx = canvas.getContext('2d');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const messageInput = document.getElementById('messageInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const statusDiv = document.getElementById('status');
+        const statsDiv = document.getElementById('stats');
+
+        let frameCount = 0;
+        let audioCount = 0;
+        let lastFpsUpdate = Date.now();
+        let fps = 0;
+
+        function updateStatus(status, className) {
+            statusDiv.textContent = `Status: ${status}`;
+            statusDiv.className = `status ${className}`;
+        }
+
+        function updateStats() {
+            const now = Date.now();
+            if (now - lastFpsUpdate >= 1000) {
+                fps = frameCount;
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
+            statsDiv.textContent = `Frames: ${frameCount} | Audio chunks: ${audioCount} | FPS: ${fps}`;
+        }
+
+        async function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                console.log('Audio context initialized');
+            }
+        }
+
+        async function playAudioChunk(audioData, sampleRate) {
+            await initAudioContext();
+
+            // Decode base64 to binary
+            const binaryString = atob(audioData);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+
+            // Convert int16 PCM to Float32Array
+            const int16Array = new Int16Array(bytes.buffer);
+            const float32Array = new Float32Array(int16Array.length);
+            for (let i = 0; i < int16Array.length; i++) {
+                float32Array[i] = int16Array[i] / 32768.0;
+            }
+
+            // Create audio buffer
+            const audioBuffer = audioContext.createBuffer(1, float32Array.length, sampleRate);
+            audioBuffer.getChannelData(0).set(float32Array);
+
+            // Create source and play
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+            source.start();
+
+            audioCount++;
+        }
+
+        async function processAudioQueue() {
+            if (isPlayingAudio || audioQueue.length === 0) return;
+
+            isPlayingAudio = true;
+            const { data, sampleRate } = audioQueue.shift();
+
+            try {
+                await playAudioChunk(data, sampleRate);
+            } catch (error) {
+                console.error('Error playing audio:', error);
+            }
+
+            isPlayingAudio = false;
+
+            // Process next chunk
+            if (audioQueue.length > 0) {
+                setTimeout(processAudioQueue, 10);
+            }
+        }
+
+        function connect() {
+            updateStatus('Connecting...', 'connecting');
+            connectBtn.disabled = true;
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+            console.log('Connecting to:', wsUrl);
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateStatus('Connected', 'connected');
+                disconnectBtn.disabled = false;
+                messageInput.disabled = false;
+                sendBtn.disabled = false;
+
+                // Send ping every 30 seconds to keep connection alive
+                setInterval(() => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 30000);
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+
+                if (message.type === 'video') {
+                    // Decode base64 JPEG and draw on canvas
+                    const img = new Image();
+                    img.onload = () => {
+                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                        frameCount++;
+                        updateStats();
+                    };
+                    img.src = 'data:image/jpeg;base64,' + message.data;
+                } else if (message.type === 'audio') {
+                    // Queue audio for playback
+                    audioQueue.push({
+                        data: message.data,
+                        sampleRate: message.sample_rate
+                    });
+                    processAudioQueue();
+                } else if (message.type === 'pong') {
+                    // Pong received
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateStatus('Error', 'disconnected');
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateStatus('Disconnected', 'disconnected');
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                messageInput.disabled = true;
+                sendBtn.disabled = true;
+                ws = null;
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+            }
+        }
+
+        function sendMessage() {
+            const text = messageInput.value.trim();
+            if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+            ws.send(JSON.stringify({
+                type: 'text',
+                text: text
+            }));
+
+            messageInput.value = '';
+            console.log('Sent:', text);
+        }
+
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        sendBtn.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // Update stats every 100ms
+        setInterval(updateStats, 100);
+    </script>
+</body>
+</html>
