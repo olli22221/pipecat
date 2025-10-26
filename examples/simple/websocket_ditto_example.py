@@ -105,14 +105,25 @@ class WebSocketOutputProcessor(FrameProcessor):
         if isinstance(frame, OutputImageRawFrame):
             self._frame_count += 1
 
-            # Convert RGB frame to JPEG for efficient streaming
-            # frame.image is already RGB numpy array
             height, width = frame.size[1], frame.size[0]
-            frame_array = np.frombuffer(frame.image, dtype=np.uint8).reshape((height, width, 3))
 
-            # Encode as JPEG
-            _, jpeg_data = cv2.imencode('.jpg', cv2.cvtColor(frame_array, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
-            jpeg_base64 = base64.b64encode(jpeg_data.tobytes()).decode('utf-8')
+            # Check if frame is already JPEG compressed
+            if frame.format == "JPEG":
+                # Frame is already JPEG - just encode to base64
+                jpeg_base64 = base64.b64encode(frame.image).decode('utf-8')
+
+                if self._frame_count == 1:
+                    logger.info(f"✅ Receiving pre-compressed JPEG frames ({len(frame.image):,} bytes)")
+            else:
+                # Convert RGB frame to JPEG
+                frame_array = np.frombuffer(frame.image, dtype=np.uint8).reshape((height, width, 3))
+
+                # Encode as JPEG
+                _, jpeg_data = cv2.imencode('.jpg', cv2.cvtColor(frame_array, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
+                jpeg_base64 = base64.b64encode(jpeg_data.tobytes()).decode('utf-8')
+
+                if self._frame_count == 1:
+                    logger.info(f"Converting RGB to JPEG ({len(jpeg_data.tobytes()):,} bytes)")
 
             # Send to all connected clients
             message = {
@@ -287,6 +298,8 @@ async def start_bot():
         chunk_size=(3, 5, 2),
         save_frames_dir=save_frames_dir,
         target_fps=30,
+        compress_frames=True,  # Enable JPEG compression at source
+        jpeg_quality=75,  # Balance quality vs size (75 = good quality, ~40-50x compression)
     )
 
     # WebSocket output processor

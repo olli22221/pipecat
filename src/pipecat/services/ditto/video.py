@@ -61,8 +61,13 @@ class DittoTalkingHeadService(FrameProcessor):
         chunk_size: Audio chunk size tuple (history, current, future) frames
                    - Default (3, 5, 2) = ~200ms latency, 50% overlap
         save_frames_dir: Optional directory path to save generated frames as PNG files
-        target_fps: Target frame rate for PTS calculation (default: 50)
-                   - Note: Actual FPS depends on SDK generation speed
+        target_fps: Target frame rate for PTS calculation and rate limiting (default: 50)
+                   - Note: Actual generation FPS depends on SDK speed
+        compress_frames: Enable JPEG compression of frames before transport (default: True)
+                        - Reduces ~8MB raw RGB to ~200KB JPEG per frame (~40x compression)
+        jpeg_quality: JPEG quality level 1-100 (default: 75)
+                     - Higher = better quality but larger size
+                     - 75 is good balance of quality vs bandwidth
         **kwargs: Additional arguments passed to FrameProcessor
     """
 
@@ -76,6 +81,8 @@ class DittoTalkingHeadService(FrameProcessor):
         chunk_size: tuple = (3, 5, 2),
         save_frames_dir: Optional[str] = None,
         target_fps: int = 50,
+        compress_frames: bool = True,
+        jpeg_quality: int = 75,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -87,6 +94,8 @@ class DittoTalkingHeadService(FrameProcessor):
         self._chunk_size = chunk_size
         self._save_frames_dir = save_frames_dir
         self._target_fps = target_fps
+        self._compress_frames = compress_frames
+        self._jpeg_quality = jpeg_quality
         
         # Initialize ALL queues and state variables
         self._video_frame_queue = asyncio.Queue()  # For transferring frames from capture to playback
@@ -619,12 +628,45 @@ class DittoTalkingHeadService(FrameProcessor):
 
                     frame, frame_time_offset_s, audio_frames = frame_data
 
-                    # Create OutputImageRawFrame
-                    output_frame = OutputImageRawFrame(
-                        image=frame,
-                        size=(frame.shape[1], frame.shape[0]),  # (width, height)
-                        format="RGB"
-                    )
+                    # Compress frame if enabled
+                    if self._compress_frames:
+                        # Convert RGB to BGR for OpenCV
+                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+                        # Encode as JPEG
+                        success, jpeg_data = cv2.imencode(
+                            '.jpg',
+                            frame_bgr,
+                            [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
+                        )
+
+                        if not success:
+                            logger.error(f"{self}: Failed to encode frame as JPEG")
+                            continue
+
+                        # Use compressed JPEG data
+                        frame_data_to_send = jpeg_data.tobytes()
+
+                        # Create OutputImageRawFrame with JPEG data
+                        output_frame = OutputImageRawFrame(
+                            image=frame_data_to_send,
+                            size=(frame.shape[1], frame.shape[0]),  # (width, height)
+                            format="JPEG"
+                        )
+
+                        if frames_pushed == 0:
+                            # Log compression stats for first frame
+                            raw_size = frame.nbytes
+                            compressed_size = len(frame_data_to_send)
+                            ratio = raw_size / compressed_size
+                            logger.info(f"{self}: 🗜️ JPEG compression: {raw_size:,} bytes → {compressed_size:,} bytes ({ratio:.1f}x reduction)")
+                    else:
+                        # No compression - use raw RGB
+                        output_frame = OutputImageRawFrame(
+                            image=frame,
+                            size=(frame.shape[1], frame.shape[0]),  # (width, height)
+                            format="RGB"
+                        )
 
                     # Set PTS if we have audio timing
                     if self._first_audio_pts is not None:

@@ -178,6 +178,8 @@ async def run_ditto_bot(webrtc_connection: SmallWebRTCConnection):
         chunk_size=(3, 5, 2),  # (history, current, future) frames
         save_frames_dir=save_frames_dir,  # Save frames to this directory
         target_fps=30,  # Target FPS for video generation
+        compress_frames=True,  # Enable JPEG compression at source
+        jpeg_quality=75,  # Balance quality vs size (75 = good quality, ~40-50x compression)
     )
 
     # Create context
