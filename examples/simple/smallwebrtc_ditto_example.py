@@ -270,6 +270,19 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
         pipecat_connection = SmallWebRTCConnection(ice_servers)
         await pipecat_connection.initialize(sdp=request["sdp"], type=request["type"])
 
+        # IMPORTANT: Wait for ICE gathering to complete before returning answer
+        # Otherwise the SDP answer won't contain ICE candidates
+        max_wait = 5  # seconds
+        waited = 0
+        while pipecat_connection.pc.iceGatheringState != "complete" and waited < max_wait:
+            await asyncio.sleep(0.1)
+            waited += 0.1
+
+        if pipecat_connection.pc.iceGatheringState == "complete":
+            logger.info(f"ICE gathering completed in {waited:.1f}s")
+        else:
+            logger.warning(f"ICE gathering timeout after {max_wait}s, state: {pipecat_connection.pc.iceGatheringState}")
+
         @pipecat_connection.event_handler("closed")
         async def handle_disconnected(webrtc_connection: SmallWebRTCConnection):
             logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
