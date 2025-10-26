@@ -283,6 +283,18 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
         else:
             logger.warning(f"ICE gathering timeout after {max_wait}s, state: {pipecat_connection.pc.iceGatheringState}")
 
+        # Debug: Check if SDP contains ICE candidates
+        answer = pipecat_connection.get_answer()
+        if answer and answer.get("sdp"):
+            candidate_count = answer["sdp"].count("a=candidate:")
+            logger.info(f"SDP answer contains {candidate_count} ICE candidates")
+            if candidate_count == 0:
+                logger.error("❌ No ICE candidates in SDP answer! Connection will fail.")
+        else:
+            logger.error("❌ No SDP in answer!")
+
+        # Continue with rest of setup
+
         @pipecat_connection.event_handler("closed")
         async def handle_disconnected(webrtc_connection: SmallWebRTCConnection):
             logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
