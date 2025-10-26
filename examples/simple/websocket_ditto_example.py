@@ -60,6 +60,7 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     Frame,
+    InputAudioRawFrame,
     OutputAudioRawFrame,
     OutputImageRawFrame,
     TextFrame,
@@ -239,6 +240,29 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.info(f"TextFrame queued successfully")
                 else:
                     logger.error("Task is None, cannot queue frame!")
+            elif message.get("type") == "audio":
+                # User sent microphone audio
+                if task:
+                    # Decode base64 audio
+                    audio_base64 = message.get("data", "")
+                    audio_bytes = base64.b64decode(audio_base64)
+
+                    # Get audio parameters
+                    sample_rate = message.get("sample_rate", 16000)
+                    num_channels = message.get("num_channels", 1)
+
+                    # Create InputAudioRawFrame
+                    audio_frame = InputAudioRawFrame(
+                        audio=audio_bytes,
+                        sample_rate=sample_rate,
+                        num_channels=num_channels
+                    )
+
+                    # Queue to pipeline
+                    await task.queue_frames([audio_frame])
+                    logger.debug(f"Queued audio frame: {len(audio_bytes)} bytes, {sample_rate}Hz")
+                else:
+                    logger.error("Task is None, cannot queue audio frame!")
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
@@ -258,6 +282,7 @@ async def start_bot():
     logger.info("=" * 70)
 
     # Get API keys
+    deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
     openai_api_key = os.getenv("OPENAI_API_KEY")
 
     # Ditto configuration
@@ -278,6 +303,7 @@ async def start_bot():
     logger.info(f"✅ Using avatar image: {source_image}")
 
     # Initialize services
+    stt = DeepgramSTTService(api_key=deepgram_api_key)
     llm = OpenAILLMService(api_key=openai_api_key, model="gpt-4o-mini")
 
     # Initialize Higgs Audio TTS
@@ -313,8 +339,9 @@ async def start_bot():
         }]
     )
 
-    # Build pipeline (no STT for now - will add later)
+    # Build pipeline with STT for microphone input
     pipeline = Pipeline([
+        stt,  # Speech-to-text from microphone
         LLMUserContextAggregator(context),
         llm,
         tts,

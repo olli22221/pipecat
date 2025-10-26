@@ -61,6 +61,21 @@
             background: #ccc;
             cursor: not-allowed;
         }
+        button.mic {
+            background: #2196F3;
+            color: white;
+        }
+        button.mic:hover {
+            background: #0b7dda;
+        }
+        button.mic.active {
+            background: #f44336;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
         .status {
             margin-top: 20px;
             padding: 15px;
@@ -111,10 +126,11 @@
         <div class="controls">
             <button id="connectBtn" class="connect">Connect</button>
             <button id="disconnectBtn" class="disconnect" disabled>Disconnect</button>
+            <button id="micBtn" class="mic" disabled>🎤 Hold to Talk</button>
         </div>
 
         <div class="chat-input">
-            <input type="text" id="messageInput" placeholder="Type a message and press Enter..." disabled>
+            <input type="text" id="messageInput" placeholder="Type a message and press Enter (or use microphone)..." disabled>
             <button id="sendBtn" disabled>Send</button>
         </div>
 
@@ -133,10 +149,18 @@
         let audioQueue = [];
         let isPlayingAudio = false;
 
+        // Microphone capture
+        let micStream = null;
+        let micAudioContext = null;
+        let micProcessor = null;
+        let micSource = null;
+        let isMicActive = false;
+
         const canvas = document.getElementById('videoCanvas');
         const ctx = canvas.getContext('2d');
         const connectBtn = document.getElementById('connectBtn');
         const disconnectBtn = document.getElementById('disconnectBtn');
+        const micBtn = document.getElementById('micBtn');
         const messageInput = document.getElementById('messageInput');
         const sendBtn = document.getElementById('sendBtn');
         const statusDiv = document.getElementById('status');
@@ -219,6 +243,88 @@
             }
         }
 
+        async function initMicrophone() {
+            try {
+                console.log('Requesting microphone access...');
+                micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: 16000,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                micAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                micSource = micAudioContext.createMediaStreamSource(micStream);
+
+                // Use ScriptProcessorNode to capture audio (deprecated but widely supported)
+                // Buffer size: 4096 samples at 16kHz = ~256ms chunks
+                micProcessor = micAudioContext.createScriptProcessor(4096, 1, 1);
+
+                micProcessor.onaudioprocess = (event) => {
+                    if (!isMicActive || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+                    const inputData = event.inputBuffer.getChannelData(0);
+
+                    // Convert Float32 to Int16 PCM
+                    const int16Data = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        const s = Math.max(-1, Math.min(1, inputData[i]));
+                        int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+
+                    // Convert to base64 and send
+                    const audioBase64 = btoa(String.fromCharCode.apply(null, new Uint8Array(int16Data.buffer)));
+
+                    ws.send(JSON.stringify({
+                        type: 'audio',
+                        data: audioBase64,
+                        sample_rate: 16000,
+                        num_channels: 1
+                    }));
+                };
+
+                console.log('Microphone initialized');
+                return true;
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                alert('Failed to access microphone. Please allow microphone permissions.');
+                return false;
+            }
+        }
+
+        async function startMicrophone() {
+            if (!micStream) {
+                const success = await initMicrophone();
+                if (!success) return;
+            }
+
+            isMicActive = true;
+            micBtn.classList.add('active');
+            micBtn.textContent = '🔴 Recording...';
+
+            // Connect audio graph
+            micSource.connect(micProcessor);
+            micProcessor.connect(micAudioContext.destination);
+
+            console.log('Microphone started');
+        }
+
+        function stopMicrophone() {
+            isMicActive = false;
+            micBtn.classList.remove('active');
+            micBtn.textContent = '🎤 Hold to Talk';
+
+            if (micProcessor && micSource) {
+                micSource.disconnect();
+                micProcessor.disconnect();
+            }
+
+            console.log('Microphone stopped');
+        }
+
         function connect() {
             updateStatus('Connecting...', 'connecting');
             connectBtn.disabled = true;
@@ -235,6 +341,7 @@
                 disconnectBtn.disabled = false;
                 messageInput.disabled = false;
                 sendBtn.disabled = false;
+                micBtn.disabled = false;
 
                 // Send ping every 30 seconds to keep connection alive
                 setInterval(() => {
@@ -280,11 +387,34 @@
                 disconnectBtn.disabled = true;
                 messageInput.disabled = true;
                 sendBtn.disabled = true;
+                micBtn.disabled = true;
+
+                // Stop microphone if active
+                if (isMicActive) {
+                    stopMicrophone();
+                }
+
                 ws = null;
             };
         }
 
         function disconnect() {
+            // Stop microphone if active
+            if (isMicActive) {
+                stopMicrophone();
+            }
+
+            // Close microphone stream
+            if (micStream) {
+                micStream.getTracks().forEach(track => track.stop());
+                micStream = null;
+            }
+
+            if (micAudioContext) {
+                micAudioContext.close();
+                micAudioContext = null;
+            }
+
             if (ws) {
                 ws.close();
             }
@@ -310,6 +440,23 @@
             if (e.key === 'Enter') {
                 sendMessage();
             }
+        });
+
+        // Microphone push-to-talk
+        micBtn.addEventListener('mousedown', startMicrophone);
+        micBtn.addEventListener('mouseup', stopMicrophone);
+        micBtn.addEventListener('mouseleave', () => {
+            if (isMicActive) stopMicrophone();
+        });
+
+        // Touch events for mobile
+        micBtn.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            startMicrophone();
+        });
+        micBtn.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            stopMicrophone();
         });
 
         // Update stats every 100ms
